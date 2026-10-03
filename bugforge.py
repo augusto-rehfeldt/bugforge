@@ -30,6 +30,8 @@ import json
 import os
 import platform
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -60,6 +62,11 @@ DENIED = ("os", "shutil", "subprocess", "socket", "tempfile", "signal", "multipr
           "builtins", "importlib", "pickle", "marshal", "code", "runpy", "threading", "concurrent", "io",
           "logging", "mmap", "select", "selectors", "venv", "ensurepip", "site", "sysconfig", "gc", "atexit")
 GITHUB_SEARCH = "https://api.github.com/search/issues?"
+RESULTS_REPO = os.getenv("BUGFORGE_RESULTS_REPO", "bugforge-results")  # `name` or `owner/name`
+RESULTS_CHECKOUT = Path(os.getenv("BUGFORGE_RESULTS_DIR") or Path.home() / "bugforge-results")
+PUBLISH_STATUSES = ("bug", "doc-bug")
+BUGFORGE_URL = "https://github.com/augusto-rehfeldt/bugforge"
+_REPO_LOCK = threading.Lock()
 
 
 def check_target(module: str, unsafe: bool = False) -> None:
@@ -398,6 +405,99 @@ def report(module: str, results: list) -> str:
     return "\n".join(out) + "\n"
 
 
+def _checkout() -> tuple[str, Path]:
+    """(owner/name, local checkout) of the public results repository, created on first use."""
+    repo = RESULTS_REPO
+    if "/" not in repo:
+        login = mf._gh("gh", "api", "user", "-q", ".login").stdout.strip()
+        if not login:
+            raise RuntimeError("gh is not logged in (gh auth login)")
+        repo = f"{login}/{repo}"
+    if not (RESULTS_CHECKOUT / ".git").exists():
+        if mf._gh("gh", "repo", "view", repo).returncode != 0:
+            made = mf._gh("gh", "repo", "create", repo, "--public", "--description",
+                          "Reproduced bugs in Python libraries, found by bugforge; not yet reviewed by a person")
+            if made.returncode != 0:
+                raise RuntimeError(f"gh repo create {repo}: {(made.stdout + made.stderr).strip()[-300:]}")
+        cloned = mf._gh("gh", "repo", "clone", repo, str(RESULTS_CHECKOUT))
+        if cloned.returncode != 0:
+            raise RuntimeError(f"gh repo clone {repo}: {(cloned.stdout + cloned.stderr).strip()[-300:]}")
+        mf._gh("git", "checkout", "-B", "main", cwd=RESULTS_CHECKOUT)
+    mf._gh("git", "pull", "--ff-only", "origin", "main", cwd=RESULTS_CHECKOUT)  # fails harmlessly when empty
+    return repo, RESULTS_CHECKOUT
+
+
+def results_index(checkout: Path) -> str:
+    rows = sorted((json.loads(p.read_text(encoding="utf-8")) for p in checkout.glob("*/result.json")),
+                  key=lambda m: (m.get("date", ""), m.get("folder", "")), reverse=True)
+    lines = ["# bugforge results", "",
+             f"Behaviour of Python libraries that breaks their documentation, found by [bugforge]({BUGFORGE_URL}): "
+             "one language model proposes a documented property, another searches for a failing input, a "
+             "third writes a minimal standalone reproducer, which is run, and a judge reads the reproducer, "
+             "the documentation and the project's issue tracker. Every folder holds the reproducer and its "
+             "output on the Python version named. No person reviewed these before publication; upstream "
+             "reports are filed by hand, and a result is linked to its issue once filed.", "",
+             f"{len(rows)} result(s).", "",
+             "| Date | Target | Verdict | Title | Python | Upstream |", "| --- | --- | --- | --- | --- | --- |"]
+    for m in rows:
+        title = m.get("title", "").replace("|", "\\|")
+        lines.append(f"| {m.get('date', '')} | `{m.get('target', '')}` | {m.get('status', '')} | "
+                     f"[{title}]({m['folder']}/) | {m.get('python', '')} | {m.get('upstream') or 'not filed'} |")
+    return "\n".join(lines) + "\n"
+
+
+def publish_one(run, r: dict) -> dict:
+    """One confirmed bug as a folder of the results repository. Never raises."""
+    if not shutil.which("gh") or not shutil.which("git"):
+        return {"error": "gh and git must be on PATH to publish"}
+    module = run.data.get("module", "")
+    try:
+        with _REPO_LOCK:
+            repo, checkout = _checkout()
+            folder = checkout / f"{module}-{r['id']}"
+            folder.mkdir(exist_ok=True)
+            for name in (f"{r['id']}_repro.py", f"{r['id']}_falsify.py"):
+                if (run.path / name).exists():
+                    shutil.copy2(run.path / name, folder / name)
+            (folder / "README.md").write_text(report(module, [r]), encoding="utf-8")
+            title = (r.get("judge") or {}).get("issue_title") or r.get("title", r["id"])
+            meta = folder / "result.json"
+            upstream = json.loads(meta.read_text(encoding="utf-8")).get("upstream") if meta.exists() else None
+            meta.write_text(json.dumps({
+                "folder": folder.name, "status": r["status"], "target": r.get("target", ""), "title": title,
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "python": platform.python_version(),
+                "run": run.path.name, "id": r["id"], "upstream": upstream}, indent=2) + "\n", encoding="utf-8")
+            (checkout / "README.md").write_text(results_index(checkout), encoding="utf-8")
+            mf._gh("git", "add", "-A", cwd=checkout)
+            mf._gh("git", "commit", "-m", f"{r['status']}: {title}", cwd=checkout)
+            pushed = mf._gh("git", "push", "-u", "origin", "main", cwd=checkout)
+            if pushed.returncode != 0:
+                return {"error": f"git push: {(pushed.stdout + pushed.stderr).strip()[-300:]}"}
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    return {"url": f"https://github.com/{repo}/tree/main/{folder.name}", "status": r["status"], "title": title}
+
+
+def publish(run, results: list) -> list:
+    """Publish every bug and doc-bug once; the URL is cached in state.json, a failure is retried next time."""
+    published = []
+    for r in results:
+        if r["status"] not in PUBLISH_STATUSES:
+            continue
+        key = f"{r['id']}.published"
+        info = run.data.get(key) or {}
+        if not info.get("url"):
+            info = publish_one(run, r)
+            if info.get("url"):
+                with run.lock:
+                    run.data[key] = info
+                run.save()
+        mf.log(f"published: {info['url']}" if info.get("url") else f"publish failed: {info.get('error')}", r["id"])
+        if info.get("url"):
+            published.append(info)
+    return published
+
+
 def _index() -> list:
     path = OUTPUT_ROOT / "index.json"
     if not path.exists():
@@ -426,7 +526,7 @@ def next_targets(n: int) -> list:
 
 
 def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_dir: Path | None = None,
-             unsafe: bool = False) -> dict:
+             unsafe: bool = False, publish_results: bool = False) -> dict:
     check_target(module, unsafe)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run = mf.Run(run_dir or OUTPUT_ROOT / f"{module}-{stamp}")
@@ -445,7 +545,9 @@ def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     (run.path / "report.md").write_text(report(module, results), encoding="utf-8")
     mf.log(f"{module} done in {mf._dur(time.time() - started)}: {tally}  ({run.path / 'report.md'})")
+    published = publish(run, results) if publish_results else []
     summary = {"module": module, "path": run.path.name, "tally": tally, "environment": environment(module),
+               "published": [p["url"] for p in published],
                "finished": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
     _save_index([row for row in _index() if row.get("path") != run.path.name] + [summary])
     return summary
@@ -462,12 +564,23 @@ def main(argv=None) -> int:
     ap.add_argument("--provider")
     ap.add_argument("--model")
     ap.add_argument("--review-model")
+    ap.add_argument("--publish", action="store_true",
+                    help=f"push every bug / doc-bug to the PUBLIC GitHub repository {RESULTS_REPO} (needs gh); "
+                         "files nothing upstream")
+    ap.add_argument("--publish-existing", action="store_true", help="publish qualifying results already on disk and exit")
     ap.add_argument("--unsafe-target", action="store_true",
                     help="allow a module outside AUTO_TARGETS; generated scripts run unsandboxed")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
+    if args.publish_existing:  # no model calls: the reports and reproducers are on disk
+        count = 0
+        for state in sorted(OUTPUT_ROOT.glob("*/state.json")):
+            run = mf.Run(state.parent)
+            count += len(publish(run, run.data.get("results") or []))
+        mf.log(f"publish: {count} result(s) published")
+        return 0
     if not (args.modules or args.auto or args.forever or args.resume):
-        ap.error("give module names, --auto N, --forever or --resume DIR")
+        ap.error("give module names, --auto N, --forever, --resume DIR or --publish-existing")
     for m in args.modules:
         try:
             check_target(m, args.unsafe_target)
@@ -486,13 +599,14 @@ def main(argv=None) -> int:
 
     if args.resume:
         path = Path(args.resume)
-        research(forge_for, mf.Run(path).data["module"], args.properties, args.workers, path, args.unsafe_target)
+        research(forge_for, mf.Run(path).data["module"], args.properties, args.workers, path, args.unsafe_target,
+                 args.publish)
     for m in args.modules:
-        research(forge_for, m, args.properties, args.workers, unsafe=args.unsafe_target)
+        research(forge_for, m, args.properties, args.workers, unsafe=args.unsafe_target, publish_results=args.publish)
     while args.auto or args.forever:
         for m in next_targets(args.auto or 5):
             try:
-                research(forge_for, m, args.properties, args.workers)
+                research(forge_for, m, args.properties, args.workers, publish_results=args.publish)
             except Exception as exc:
                 mf.log(f"{m} failed: {type(exc).__name__}: {exc}")
         if not args.forever:

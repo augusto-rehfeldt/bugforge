@@ -207,5 +207,44 @@ class BugforgeRobustnessTest(unittest.TestCase):
         self.assertIn("Create+a+continuous", get.call_args_list[0][0][0])
 
 
+class BugforgePublishTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.checkout = self.tmp / "results"
+        self.checkout.mkdir()
+        self.calls = []
+
+        def gh(*args, cwd=None, timeout=180):
+            self.calls.append(args)
+            return bf.subprocess.CompletedProcess(args, 0, "", "")
+        for obj, name, value in ((bf, "OUTPUT_ROOT", self.tmp), (bf.mf, "_gh", gh),
+                                 (bf, "_checkout", lambda: ("u/bugforge-results", self.checkout))):
+            patcher = mock.patch.object(obj, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_only_confirmed_bugs_are_published_once_with_their_reproducer(self):
+        run = bf.mf.Run(self.tmp / "statistics-20261003-010644")
+        run.data["module"] = "statistics"
+        (run.path / "c1_repro.py").write_text("import statistics", encoding="utf-8")
+        bug = {"id": "c1", "title": "kde overflows", "target": "statistics.kde", "statement": "p", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED", code="import statistics"),
+               "judge": {"verdict": "BUG", "issue_title": "statistics.kde logistic kernel overflows"}}
+        held = {"id": "c2", "target": "statistics.mean", "statement": "q", "status": "holds",
+                "falsification": _ran("NO COUNTEREXAMPLE")}
+        with mock.patch.object(bf.shutil, "which", return_value="x"):
+            got = bf.publish(run, [bug, held])
+            again = bf.publish(run, [bug, held])
+        self.assertEqual([g["url"] for g in got], ["https://github.com/u/bugforge-results/tree/main/statistics-c1"])
+        self.assertEqual(again, got)
+        self.assertEqual(sum(1 for c in self.calls if c[:2] == ("git", "push")), 1)
+        folder = self.checkout / "statistics-c1"
+        self.assertIn("import statistics", (folder / "README.md").read_text(encoding="utf-8"))
+        self.assertTrue((folder / "c1_repro.py").exists())
+        index = (self.checkout / "README.md").read_text(encoding="utf-8")
+        self.assertIn("statistics.kde logistic kernel overflows", index)
+        self.assertIn("not filed", index)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,7 +33,14 @@ scripts and `report.md`. `bug_output/index.json` records every run.
 
 ## Rules
 
-- **Nothing is filed.** A `bug` gets a drafted issue in `report.md`: environment,
+- **Publishing.** `--publish` pushes every `bug` and `doc-bug` result to the public
+  GitHub repository `<you>/bugforge-results` (`BUGFORGE_RESULTS_REPO`, checkout
+  `~/bugforge-results` or `BUGFORGE_RESULTS_DIR`). Each one gets a folder holding
+  the report, the reproducer and the search script, and the repository's index
+  lists them. `--publish-existing` publishes results already on disk without any
+  model calls. After a report is filed upstream, set `upstream` in its
+  `result.json` and the index links it.
+- **Nothing is filed upstream automatically.** A `bug` gets a drafted issue in `report.md`: environment,
   documented behavior, expected and actual results, reproducer and its output.
   Maintainers already get too many AI reports, so a person runs the reproducer
   and checks the tracker before filing.
