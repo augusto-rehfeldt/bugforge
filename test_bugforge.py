@@ -10,6 +10,9 @@ import sys
 sys.path.insert(0, str(bf.MATHFORGE.parent / "seqforge"))
 import seqforge
 
+_real_gh_token = bf._gh_token
+bf._gh_token = lambda: ""  # offline: the search tests must not ask the gh CLI for a login
+
 
 class StubAI:
     def __init__(self, replies):
@@ -343,6 +346,31 @@ class BugforgePublishTest(unittest.TestCase):
         with mock.patch.object(bf.mf, "log") as log:
             bf.publish(run, [stale])
         self.assertIn("no longer qualifies", log.call_args[0][0])
+
+    def test_low_severity_is_held_back_and_a_filed_issue_is_linked(self):
+        run = bf.mf.Run(self.tmp / "heapq-20261003-022813")
+        run.data["module"] = "heapq"
+        low = {"id": "c1", "target": "heapq.merge", "statement": "p", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED"), "judge": {"verdict": "BUG", "severity": "low"}}
+        medium = {**low, "id": "c2", "judge": {"verdict": "BUG", "severity": "medium", "issue_title": "merge breaks"}}
+        with mock.patch.object(bf.shutil, "which", return_value="x"):
+            got = bf.publish(run, [low, medium])
+        self.assertEqual([g["url"].rsplit("/", 1)[-1] for g in got], ["heapq-20261003-022813-c2"])
+        url = "https://github.com/python/cpython/issues/158631"
+        self.assertEqual(bf.link_upstream("heapq-20261003-022813-c2", url), "")
+        self.assertIn(f"[cpython#158631]({url})", (self.checkout / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("no such published result", bf.link_upstream("heapq-nope", url))
+
+    def test_gh_login_is_the_fallback_search_token(self):
+        self.calls.clear()
+        _real_gh_token.cache_clear()
+        with mock.patch.object(bf.shutil, "which", return_value=None):
+            self.assertEqual(_real_gh_token(), "")
+        _real_gh_token.cache_clear()
+        with mock.patch.object(bf.shutil, "which", return_value="x"):
+            self.assertEqual(_real_gh_token(), "")  # the stub gh prints nothing
+        self.assertEqual(self.calls, [("gh", "auth", "token")])
+        _real_gh_token.cache_clear()
 
     def test_published_report_names_the_environment_of_the_run(self):
         r = {"id": "c1", "target": "statistics.kde", "statement": "p", "status": "bug",

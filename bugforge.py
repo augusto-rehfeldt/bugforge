@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import importlib
 import importlib.metadata
 import importlib.util
@@ -109,15 +110,27 @@ _GITHUB_LOCK = threading.Lock()
 _GITHUB_LAST = [0.0]
 
 
+@functools.lru_cache(maxsize=1)
+def _gh_token() -> str:
+    """The gh CLI's own login, for when GITHUB_TOKEN is unset; empty when gh is missing or logged out."""
+    if not shutil.which("gh"):
+        return ""
+    try:
+        return mf._gh("gh", "auth", "token", timeout=15).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 def github(url: str) -> dict:
     """GitHub search, spaced under its per-minute limit across threads, one retry on a limit reply.
 
     ponytail: spacing is per process; two bugforge processes at once can still hit the limit.
     """
     headers = {"User-Agent": mf.USER_AGENT, "Accept": "application/vnd.github+json"}
-    if os.getenv("GITHUB_TOKEN"):  # 30 searches a minute instead of 10; sent only to api.github.com
-        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
-    gap = 2.0 if os.getenv("GITHUB_TOKEN") else 6.0
+    token = os.getenv("GITHUB_TOKEN") or _gh_token()
+    if token:  # 30 searches a minute instead of 10; sent only to api.github.com
+        headers["Authorization"] = f"Bearer {token}"
+    gap = 2.0 if token else 6.0
     for attempt in range(2):
         with _GITHUB_LOCK:
             time.sleep(max(0.0, _GITHUB_LAST[0] + gap - time.time()))
@@ -579,6 +592,10 @@ def publish(run, results: list) -> list:
             mf.log("not published: the duplicate search was incomplete", r["id"])
             continue
         info = run.data.get(key) or {}
+        if not info.get("url") and (r.get("judge") or {}).get("severity") == "low":
+            # two thirds of confirmed results are low: contrived inputs no maintainer would act on
+            mf.log("not published: low severity (the draft stays in report.md)", r["id"])
+            continue
         if not info.get("url"):
             info = publish_one(run, r)
             if info.get("url"):
@@ -589,6 +606,29 @@ def publish(run, results: list) -> list:
         if info.get("url"):
             published.append(info)
     return published
+
+
+def link_upstream(folder: str, url: str) -> str:
+    """Record the upstream issue filed by hand for a published result; returns an error or ''."""
+    try:
+        with _REPO_LOCK:
+            _repo, checkout = _checkout()
+            meta = checkout / Path(folder).name / "result.json"
+            if not meta.exists():
+                return f"{folder}: no such published result in {checkout}"
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            number = re.search(r"github\.com/([^/]+)/([^/]+)/(?:issues|pull)/(\d+)", url)
+            data["upstream"] = f"[{number.group(2)}#{number.group(3)}]({url})" if number else url
+            meta.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            (checkout / "README.md").write_text(results_index(checkout), encoding="utf-8")
+            mf._gh("git", "add", "-A", cwd=checkout)
+            mf._gh("git", "commit", "-m", f"Link {meta.parent.name} to {url}", cwd=checkout)
+            pushed = mf._gh("git", "push", "-u", "origin", "main", cwd=checkout)
+            if pushed.returncode != 0:
+                return f"git push: {(pushed.stdout + pushed.stderr).strip()[-300:]}"
+    except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 def _index() -> list:
@@ -669,7 +709,15 @@ def main(argv=None) -> int:
     ap.add_argument("--unsafe-target", action="store_true",
                     help="allow a module outside AUTO_TARGETS; generated scripts run unsandboxed")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--link", nargs=2, metavar=("FOLDER", "URL"),
+                    help="record the upstream issue URL you filed for a published result folder and exit")
     args = ap.parse_args(argv)
+    if args.link:
+        error = link_upstream(*args.link)
+        if error:
+            ap.error(error)
+        mf.log(f"linked {args.link[0]} to {args.link[1]}")
+        return 0
     if args.publish_existing:  # no model calls: the reports and reproducers are on disk
         count = 0
         for state in sorted(OUTPUT_ROOT.glob("*/state.json")):

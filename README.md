@@ -44,13 +44,14 @@ picks and mathforge's unattended defaults are unchanged.
 
 ## Rules
 
-- **Publishing.** `--publish` pushes every `bug` and `doc-bug` result to the public
-  GitHub repository `<you>/bugforge-results` (`BUGFORGE_RESULTS_REPO`, checkout
+- **Publishing.** `--publish` pushes every `bug` and `doc-bug` result the judge did
+  not rate `low` severity to the public GitHub repository `<you>/bugforge-results` (`BUGFORGE_RESULTS_REPO`, checkout
   `~/bugforge-results` or `BUGFORGE_RESULTS_DIR`). Each one gets a folder holding
   the report, the reproducer and the search script, and the repository's index
   lists them. `--publish-existing` publishes results already on disk without any
-  model calls. After a report is filed upstream, set `upstream` in its
-  `result.json` and the index links it.
+  model calls. After a report is filed upstream, `--link FOLDER URL` records it
+  in the folder's `result.json` and the index links it. The tracker search uses
+  `GITHUB_TOKEN`, else the `gh` CLI's login (30 searches a minute instead of 10).
 - **Nothing is filed upstream automatically.** A `bug` gets a drafted issue in `report.md`: environment,
   documented behavior, expected and actual results, reproducer and its output.
   Maintainers already get too many AI reports, so a person runs the reproducer
