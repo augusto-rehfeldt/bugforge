@@ -126,11 +126,11 @@ def github(url: str) -> dict:
                 with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
                     return json.loads(response.read().decode("utf-8", "replace"))
             except urllib.error.HTTPError as exc:
-                headers = exc.headers or {}
-                limited = exc.code == 429 or headers.get("Retry-After") or headers.get("X-RateLimit-Remaining") == "0"
+                reply = exc.headers or {}
+                limited = exc.code == 429 or reply.get("Retry-After") or reply.get("X-RateLimit-Remaining") == "0"
                 if not limited or attempt:  # a 403 for a bad token is not waited out
                     raise
-                wait = headers.get("Retry-After", "")
+                wait = reply.get("Retry-After", "")
                 time.sleep(min(int(wait), 120) if str(wait).isdigit() else 60)
 
 
@@ -184,6 +184,7 @@ def source(module: str, limit: int = 30000) -> str:
 
 
 CPYTHON_MAIN = "https://raw.githubusercontent.com/python/cpython/main/Lib/"
+SHIM_CHARS = 3000  # module source shorter than this holds no implementation
 
 
 def main_diff(module: str, limit: int = 40000) -> str:
@@ -192,9 +193,15 @@ def main_diff(module: str, limit: int = 40000) -> str:
     if module.split(".")[0] not in sys.stdlib_module_names:
         return ""
     try:
-        local = inspect.getsource(importlib.import_module(module))
+        mod = importlib.import_module(module)
+        local = inspect.getsource(mod)
     except (OSError, TypeError):
         return "(compiled module: no Python source to compare with main)"
+    if len(local) < SHIM_CHARS:
+        # `datetime`, `struct`, `tomllib`: a few lines re-exporting the real code, and "identical" there
+        # told both judges the implementation matched main
+        return "(a shim over another module: the implementation was not compared with main)"
+    note = "\n(a package: only its __init__.py was compared)" if hasattr(mod, "__path__") else ""
     path = module.replace(".", "/")
     upstream, errors = None, []
     for name in (f"{path}.py", f"{path}/__init__.py"):
@@ -207,7 +214,9 @@ def main_diff(module: str, limit: int = 40000) -> str:
         return f"(could not fetch main: {'; '.join(errors)})"
     diff = "".join(difflib.unified_diff(local.splitlines(True), upstream.splitlines(True),
                                         "installed", "main", n=2))
-    return diff[:limit] if diff else "(identical to main)"
+    if len(diff) > limit:
+        return diff[:limit] + "\n(diff truncated)"
+    return (diff or "(identical to main)") + note
 
 
 def environment(module: str) -> str:
@@ -319,7 +328,7 @@ class BugForge(mf.Forge):
         # a quote mark not inside a word: "Python's docs" is no quotation
         quoted = re.search(r"(?<!\w)['\"“‘`]([^'\"”’`]{8,80})", c.get("spec_basis", ""))
         fixed = f'{name} "{" ".join(quoted.group(1).split()[:6])}"' if quoted else name
-        hits, errors = [], []
+        hits, errors, seen = [], [], set()
         for q in [fixed] + queries:
             # pull requests too: a merged fix is the strongest sign it is already handled
             url = GITHUB_SEARCH + urllib.parse.urlencode({"q": q + repo, "per_page": 8})
@@ -329,6 +338,9 @@ class BugForge(mf.Forge):
                 errors.append(f"{q}: {type(exc).__name__}: {exc}")
                 continue
             for i in items:
+                if i.get("html_url") in seen:  # the four queries overlap
+                    continue
+                seen.add(i.get("html_url"))
                 pr = i.get("pull_request")
                 body = i.get("body") or ""
                 body = body.split("</details>", 1)[-1]  # cpython's bpo-migration header says nothing
@@ -353,10 +365,12 @@ class BugForge(mf.Forge):
             + (f"SEARCHES THAT FAILED:\n{failed}\n\n" if failed else "")
             + f"HOW THE UPSTREAM DEVELOPMENT BRANCH DIFFERS FROM THE INSTALLED MODULE:\n"
             f"{self.run.data.get('main_diff') or '(not compared)'}\n\n"
-            "KNOWN if an issue or pull request above reports or fixes this behaviour (open, closed or "
-            "merged), or the upstream diff already changes the code this property is about. NEW "
-            "otherwise. A merely related issue is not enough; when unsure, say NEW.\n\n"
-            'Return ONLY JSON: {"verdict": "KNOWN"|"NEW", "known_as": "url, or the upstream change", '
+            "KNOWN only if an issue or pull request above reports or fixes this same failure (open, "
+            "closed or merged): the same function misbehaving in the same way. An issue about the same "
+            "function with another symptom, or the change that introduced the behaviour, is not it. The "
+            "upstream diff alone never makes it KNOWN: a changed line is not a fix until a test says so. "
+            "When unsure, say NEW.\n\n"
+            'Return ONLY JSON: {"verdict": "KNOWN"|"NEW", "known_as": "the url of that issue or pull request", '
             '"reasoning": "..."}',
             "verdict",
             model_type="writing",
@@ -403,8 +417,14 @@ def hunt(forge, c: dict) -> dict:
             for key in ("duplicates", "prior", "judge"):
                 run.data.pop(f"{cid}.{key}", None)
     dupes = run.stage(f"{cid}.duplicates", lambda: forge.duplicates(c))
-    known = run.stage(f"{cid}.prior", lambda: forge.prior(c, dupes))
-    if known.get("verdict") == "KNOWN":
+    try:
+        known = run.stage(f"{cid}.prior", lambda: forge.prior(c, dupes))
+    except Exception as exc:  # an advisory gate fails open: the executable stages still decide
+        known = {"verdict": "NEW", "reasoning": f"prior-art judge failed: {type(exc).__name__}: {exc}"}
+    # the hunt stops only on a tracker entry the search actually returned; "the diff looks like a fix"
+    # is an opinion, and it ended five untested hunts
+    cited = str(known.get("known_as", ""))
+    if known.get("verdict") == "KNOWN" and any(h.get("url") and h["url"] in cited for h in dupes["hits"]):
         return {**c, "status": "known", "duplicates": dupes, "prior": known}
     found = run.stage(f"{cid}.falsify", lambda: forge.falsify(c))
     found = {**found, "output": mf.canon_negatives(found["output"])}

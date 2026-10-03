@@ -407,5 +407,64 @@ class BugforgePriorArtTest(unittest.TestCase):
         self.assertEqual(seen["model_type"], "writing")
 
 
+class BugforgeGateReviewTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        patcher = mock.patch.object(bf, "OUTPUT_ROOT", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _forge(self, name, prior):
+        forge = mock.Mock()
+        forge.run = bf.mf.Run(self.tmp / name)
+        forge.duplicates.return_value = {"queries": ["q"], "errors": [],
+                                         "hits": [{"url": "https://github.com/python/cpython/issues/9"}]}
+        forge.prior.return_value = prior
+        forge.falsify.return_value = _ran("NO COUNTEREXAMPLE in 10 cases")
+        return forge
+
+    def test_known_needs_a_cited_tracker_hit_not_an_opinion_about_the_diff(self):
+        c = {"id": "c1", "target": "base64.b64decode", "statement": "p"}
+        forge = self._forge("a", {"verdict": "KNOWN", "known_as": "the upstream change"})
+        self.assertEqual(bf.hunt(forge, c)["status"], "holds")  # went on to the executable search
+        forge = self._forge("b", {"verdict": "KNOWN", "known_as": "https://github.com/python/cpython/issues/9"})
+        self.assertEqual(bf.hunt(forge, c)["status"], "known")
+
+    def test_a_failed_prior_judge_does_not_cost_the_property(self):
+        forge = self._forge("c", None)
+        forge.prior.side_effect = ValueError("no JSON")
+        self.assertEqual(bf.hunt(forge, {"id": "c1", "target": "t", "statement": "p"})["status"], "holds")
+
+    def test_rate_limit_retry_resends_the_request_headers(self):
+        import io
+        import urllib.error
+        limited = urllib.error.HTTPError("u", 403, "rate limit exceeded", {"Retry-After": "1"}, io.BytesIO(b""))
+        ok = mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b'{"items": []}'
+        with mock.patch.object(bf.urllib.request, "urlopen", side_effect=[limited, ok]) as urlopen, \
+                mock.patch.object(bf.time, "sleep"):
+            bf.github("https://api.github.com/search/issues?q=x")
+        retry = urlopen.call_args_list[1][0][0]
+        self.assertEqual(retry.get_header("User-agent"), bf.mf.USER_AGENT)
+        self.assertIsNone(retry.get_header("Retry-after"))
+
+    def test_main_diff_does_not_call_a_shim_identical_and_marks_truncation(self):
+        with mock.patch.object(bf.mf, "_http_get", side_effect=lambda url: bf.inspect.getsource(
+                bf.importlib.import_module("struct"))):
+            self.assertIn("not compared", bf.main_diff("struct"))  # a few lines re-exporting _struct
+        local = bf.inspect.getsource(bf.importlib.import_module("colorsys"))
+        with mock.patch.object(bf.mf, "_http_get", return_value=local.replace("def ", "def  ")):
+            self.assertTrue(bf.main_diff("colorsys", limit=200).endswith("(diff truncated)"))
+
+    def test_duplicate_hits_are_listed_once(self):
+        ai = StubAI(['{"queries": ["a b c", "d e f"]}'])
+        run = bf.mf.Run(self.tmp / "u")
+        run.data["module"] = "statistics"
+        item = {"title": "t", "html_url": "https://github.com/python/cpython/issues/1", "state": "open", "body": ""}
+        with mock.patch.object(bf, "github", return_value={"items": [item]}):
+            found = bf.BugForge(ai, run, None, search=True).duplicates({"target": "statistics.kde", "statement": "p"})
+        self.assertEqual(len(found["hits"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
