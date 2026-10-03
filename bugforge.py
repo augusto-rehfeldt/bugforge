@@ -423,7 +423,9 @@ class BugForge(mf.Forge):
 
     def _thread(self, r: dict) -> str:
         talk = self.run.data.get(f"{r['id']}.conversation") or {}
-        return "\n\n".join(f"{c['author']} ({c['role']}), {c['date']}:\n{c['body']}" for c in talk.get("comments") or [])
+        return "\n\n".join(
+            f"{c['author']} ({c['role']}), {c['date']}" + (f", on pull request {c['where']}" if c.get("where") else "")
+            + f":\n{c['body']}" for c in talk.get("comments") or [])
 
     def fix(self, r: dict) -> dict:
         """A patch to the module's own source, kept only when the reproducer stops confirming the bug
@@ -501,8 +503,8 @@ class BugForge(mf.Forge):
     def reply(self, r: dict, fixed: dict) -> str:
         """A draft answer to the upstream thread, for a person to check and post."""
         return self.ask(
-            "Draft a reply to the maintainers on this issue, in the reporter's voice. A person will "
-            "check it before posting.\n\n"
+            "Write a reply to the maintainers on this issue, in the reporter's voice. It may be posted "
+            "without a person reading it first, so it must hold up on its own.\n\n"
             f"ISSUE: {(r.get('judge') or {}).get('issue_title') or r.get('title', '')}\n\n"
             f"THE THREAD SO FAR:\n{self._thread(r)}\n\n"
             f"THE PATCH NOW PROPOSED:\n```diff\n{fixed['diff']}\n```\n"
@@ -731,45 +733,115 @@ def link_upstream(folder: str, url: str) -> str:
 UPSTREAM_ISSUE = re.compile(r"github\.com/([^/\s)]+)/([^/\s)]+)/(?:issues|pull)/(\d+)")
 
 
-def conversation(url: str) -> dict:
-    """An upstream issue as its maintainers left it: state, labels and the comments.
+@functools.lru_cache(maxsize=1)
+def _login() -> str:
+    """The GitHub account gh is logged in as, or ''."""
+    if not shutil.which("gh"):
+        return ""
+    try:
+        return mf._gh("gh", "api", "user", "-q", ".login", timeout=30).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
 
-    ponytail: the first 100 comments; page when a thread outgrows that.
+
+def _said(c: dict, where: str = "") -> dict:
+    """One comment, review or review remark as the thread keeps it. A bot's role is BOT: it is
+    logged, and it never makes it our turn."""
+    user = c.get("user") or {}
+    bot = user.get("type") == "Bot" or user.get("login", "").endswith("[bot]")
+    body = (f"[review: {c['state'].lower()}] " if c.get("state") else "") + (
+        f"[on {c['path']}] " if c.get("path") else "") + (c.get("body") or "")
+    return {"author": user.get("login", ""), "role": "BOT" if bot else c.get("author_association", ""),
+            "date": c.get("created_at") or c.get("submitted_at") or "", "body": body[:4000],
+            **({"where": where} if where else {})}
+
+
+def conversation(url: str, me: str = "") -> dict:
+    """An upstream issue as its maintainers left it: state, labels, linked pull requests and one
+    thread in date order. A pull request `me` opened for it is part of the discussion, so its
+    comments, reviews and review remarks join the thread, each marked with where it was said.
+
+    ponytail: the first 100 comments of each; page when a thread outgrows that.
     """
     owner, name, number = UPSTREAM_ISSUE.search(url).groups()
-    api = f"https://api.github.com/repos/{owner}/{name}/issues/{number}"
-    issue = github(api)
-    comments = github(api + "/comments?per_page=100") if issue.get("comments") else []
+    repo = f"https://api.github.com/repos/{owner}/{name}"
+    issue = github(f"{repo}/issues/{number}")
+    thread = [_said(c) for c in (github(f"{repo}/issues/{number}/comments?per_page=100") if issue.get("comments") else [])]
     prs = []
     # CPython's bot lists `gh-N` under "Linked PRs" in the issue body
     for n in dict.fromkeys(re.findall(r"gh-(\d+)", (issue.get("body") or "").partition("Linked PRs")[2])):
         try:
-            pr = github(f"https://api.github.com/repos/{owner}/{name}/pulls/{n}")
+            pr = github(f"{repo}/pulls/{n}")
+            author, where = (pr.get("user") or {}).get("login", ""), pr.get("html_url", "")
+            if me and author == me:  # someone else's pull request is their conversation, not ours
+                for part in (f"issues/{n}/comments", f"pulls/{n}/reviews", f"pulls/{n}/comments"):
+                    thread += [_said(c, where) for c in github(f"{repo}/{part}?per_page=100")
+                               if c.get("body") or c.get("state") in ("APPROVED", "CHANGES_REQUESTED")]
         except Exception:  # a deleted pull request must not hide the thread
             continue
-        prs.append({"url": pr.get("html_url", ""), "author": (pr.get("user") or {}).get("login", ""),
-                    "state": "merged" if pr.get("merged") else pr.get("state", "")})
+        prs.append({"url": where, "author": author, "state": "merged" if pr.get("merged") else pr.get("state", "")})
     return {"url": f"https://github.com/{owner}/{name}/issues/{number}", "state": issue.get("state", ""),
             "reporter": (issue.get("user") or {}).get("login", ""), "prs": prs,
             "labels": [label.get("name", "") for label in issue.get("labels") or []],
-            "updated": issue.get("updated_at", ""),
-            "comments": [{"author": (c.get("user") or {}).get("login", ""), "role": c.get("author_association", ""),
-                          "date": c.get("created_at", ""), "body": (c.get("body") or "")[:4000]} for c in comments]}
+            "updated": issue.get("updated_at", ""), "comments": sorted(thread, key=lambda c: c["date"])}
+
+
+def discover(checkout: Path, me: str) -> int:
+    """Link published results to the upstream issues (or pull requests) `me` filed for them, so a
+    report filed by hand is followed without --link; returns how many were linked.
+
+    An issue counts when it is yours, names bugforge, and either names the result's folder or
+    names the target of exactly one unlinked result. Standard library results only: another
+    project's tracker is not known here.
+    """
+    metas = {m: json.loads(m.read_text(encoding="utf-8")) for m in sorted(checkout.glob("*/result.json"))}
+    taken = {UPSTREAM_ISSUE.search(d["upstream"]).group(0) for d in metas.values()
+             if UPSTREAM_ISSUE.search(d.get("upstream") or "")}
+    unlinked = {m: d for m, d in metas.items() if not d.get("upstream")
+                and d.get("target", "").split(".")[0] in sys.stdlib_module_names}
+    if not me or not unlinked:
+        return 0
+    found = github(GITHUB_SEARCH + urllib.parse.urlencode(
+        {"q": f"repo:python/cpython author:{me} bugforge in:body", "per_page": 50})).get("items") or []
+    linked = 0
+    for item in sorted(found, key=lambda i: "pull_request" in i):  # the issue before its pull request
+        link = UPSTREAM_ISSUE.search(item.get("html_url") or "")
+        if not link or link.group(0) in taken:
+            continue
+        text = f"{item.get('title', '')}\n{item.get('body') or ''}"
+        hits = [m for m, d in unlinked.items() if d["folder"] in text] or [
+            m for m, d in unlinked.items() if d.get("target") and re.search(rf"(?<![\w.]){re.escape(d['target'])}(?![\w.])", text)]
+        if len(hits) != 1:
+            if hits:
+                mf.log(f"{item['html_url']} fits {len(hits)} results; --link the right one")
+            continue
+        data = unlinked.pop(hits[0])
+        data["upstream"] = f"[{link.group(2)}#{link.group(3)}]({item['html_url']})"
+        hits[0].write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        taken.add(link.group(0))
+        mf.log(f"{data['folder']}: found your upstream report {item['html_url']}")
+        linked += 1
+    return linked
 
 
 def track() -> int:
     """Refresh the upstream conversation of every published result that links one; returns how many
     changed. The index gets the state and comment count; the thread itself stays in the run's
     state.json, where --fix reads it. Nothing is posted."""
-    changed = 0
     with _REPO_LOCK:
         _repo, checkout = _checkout()
+        me = _login()
+        try:
+            changed = discover(checkout, me)
+        except Exception as exc:  # the search being down must not stop the threads already linked
+            mf.log(f"upstream reports not searched: {type(exc).__name__}: {exc}")
+            changed = 0
         for meta in sorted(checkout.glob("*/result.json")):
             data = json.loads(meta.read_text(encoding="utf-8"))
             if not UPSTREAM_ISSUE.search(data.get("upstream") or ""):
                 continue
             try:
-                talk = conversation(data["upstream"])
+                talk = conversation(data["upstream"], me)
             except Exception as exc:  # one unreachable issue must not hide the others
                 mf.log(f"{meta.parent.name}: not tracked: {type(exc).__name__}: {exc}")
                 continue
@@ -780,7 +852,7 @@ def track() -> int:
                 # the console scrolls away under --forever: every response is also kept in one local file
                 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
                 with open(OUTPUT_ROOT / "responses.md", "a", encoding="utf-8") as responses:
-                    responses.write(f"## {meta.parent.name}: {talk['url']}\n\n**{c['author']}** ({c['role']}), "
+                    responses.write(f"## {meta.parent.name}: {c.get('where') or talk['url']}\n\n**{c['author']}** ({c['role']}), "
                                     f"{c['date']}:\n\n{c['body']}\n\n")
             if (OUTPUT_ROOT / str(data.get("run")) / "state.json").exists():
                 run = mf.Run(OUTPUT_ROOT / data["run"])
@@ -938,7 +1010,7 @@ def take_turn(forge, cid: str, me: str, post: bool = False) -> str:
     """
     run = forge.run
     talk = run.data.get(f"{cid}.conversation") or {}
-    comments = talk.get("comments") or []
+    comments = [c for c in talk.get("comments") or [] if c.get("role") != "BOT"]  # a bot's note is no one's move
     if not comments or comments[-1]["author"] == me:
         return "waiting"
     if run.data.get(f"{cid}.answered") == comments[-1]["date"]:  # this comment was already acted on
@@ -961,14 +1033,15 @@ def take_turn(forge, cid: str, me: str, post: bool = False) -> str:
         if fixed.get("status") != "fixed":
             mf.log(f"a person has to answer {talk.get('url', '')}: no patch passed ({fixed.get('why', '')[:200]})", cid)
         elif not post:
-            mf.log("reply drafted; --post sends it", cid)
+            mf.log("reply drafted, not posted (--no-post)", cid)
         elif sum(c["author"] == me for c in comments) >= MAX_REPLIES:
             mf.log(f"a person has to answer {talk.get('url', '')}: {MAX_REPLIES} replies already sent", cid)
         else:
             draft = run.path / f"{cid}_reply.md"
             draft.write_text(draft.read_text(encoding="utf-8").rstrip() + REPLY_FOOTER.format(url=BUGFORGE_URL),
                              encoding="utf-8")
-            sent = mf._gh("gh", "issue", "comment", talk["url"], "--body-file", str(draft))
+            # answered where it was said: on the issue, or on our own pull request
+            sent = mf._gh("gh", "issue", "comment", comments[-1].get("where") or talk["url"], "--body-file", str(draft))
             if sent.returncode != 0:
                 raise RuntimeError(f"gh issue comment: {(sent.stdout + sent.stderr).strip()[-300:]}")
             mf.log(f"replied: {sent.stdout.strip()}", cid)
@@ -980,12 +1053,13 @@ def take_turn(forge, cid: str, me: str, post: bool = False) -> str:
 
 
 def converse(forge_for, post: bool = False) -> dict:
-    """One turn of every tracked upstream thread; {run/cN: status}. Run again (or under --forever)
-    it continues each thread until it is approved or rejected."""
+    """One turn of every upstream thread; {run/cN: status}. Run again (after every module of a hunt)
+    it continues each thread until it is approved or rejected. Does nothing before the first
+    --publish: there is no results repository to read the links from, and none is created here."""
+    me = _login()
+    if not me or not (RESULTS_CHECKOUT / ".git").exists():
+        return {}
     track()
-    me = mf._gh("gh", "api", "user", "-q", ".login").stdout.strip()
-    if not me:
-        raise RuntimeError("gh is not logged in (gh auth login)")
     turns = {}
     for state in sorted(OUTPUT_ROOT.glob("*/state.json")):
         run = mf.Run(state.parent)
@@ -1046,12 +1120,6 @@ def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_
     (run.path / "report.md").write_text(report(module, results), encoding="utf-8")
     mf.log(f"{module} done in {mf._dur(time.time() - started)}: {tally}  ({run.path / 'report.md'})")
     published = publish(run, results) if publish_results else []
-    if publish_results:
-        # ponytail: every linked issue is read after every run; space it out when there are dozens
-        try:
-            track()
-        except Exception as exc:  # the tracker being down must not cost the run its index entry
-            mf.log(f"track failed: {type(exc).__name__}: {exc}")
     summary = {"module": module, "path": run.path.name, "tally": tally, "environment": environment(module),
                "published": [p["url"] for p in published],
                "finished": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
@@ -1089,12 +1157,13 @@ def main(argv=None) -> int:
                     help="patch the bug ID (c1, c2, ...) of run directory RUN, keep the patch only if the "
                          "reproducer and the test suite pass, draft the upstream reply, and exit")
     ap.add_argument("--converse", action="store_true",
-                    help="take one turn in every tracked upstream thread: a comment that asks or proposes "
-                         "something gets a fresh fix and a drafted reply, until a maintainer approves or turns "
-                         "the idea down; alone it exits, with --auto / --forever it repeats after every module")
-    ap.add_argument("--post", action="store_true",
-                    help=f"with --converse: post each drafted reply on the upstream issue as you (gh), at most "
-                         f"{MAX_REPLIES} per issue")
+                    help="take one turn in every upstream thread now and exit. Every hunt does this by itself "
+                         "after each module: it finds the issues you filed for published results, and a comment "
+                         "there (or on your pull request) that asks or proposes something gets a fresh fix and "
+                         f"a reply posted as you through gh, at most {MAX_REPLIES} per issue, until a maintainer "
+                         "approves or turns the idea down")
+    ap.add_argument("--no-post", action="store_true",
+                    help="draft those replies into the run directory, post nothing upstream")
     args = ap.parse_args(argv)
     if args.track:
         mf.log(f"track: {track()} conversation(s) changed")
@@ -1116,8 +1185,6 @@ def main(argv=None) -> int:
             count += len(publish(run, run.data.get("results") or []))
         mf.log(f"publish: {count} result(s) published")
         return 0
-    if args.post and not args.converse:
-        ap.error("--post only goes with --converse")
     if not (args.modules or args.auto or args.forever or args.resume or args.fix or args.converse):
         ap.error("give module names, --auto N, --forever, --resume DIR or --publish-existing")
     for m in args.modules:
@@ -1162,12 +1229,12 @@ def main(argv=None) -> int:
             ap.error(str(exc))
 
     def talk_upstream() -> None:
-        if args.converse:
-            try:
-                for name, status in converse(forge_for, args.post).items():
-                    mf.log(f"upstream {name}: {status}")
-            except Exception as exc:  # the tracker being down must not stop the hunt
-                mf.log(f"converse failed: {type(exc).__name__}: {exc}")
+        # ponytail: every linked issue is read after every module; space it out when there are dozens
+        try:
+            for name, status in converse(forge_for, not args.no_post).items():
+                mf.log(f"upstream {name}: {status}")
+        except Exception as exc:  # the tracker being down must not stop the hunt
+            mf.log(f"converse failed: {type(exc).__name__}: {exc}")
 
     talk_upstream()
     if args.resume:
@@ -1176,6 +1243,7 @@ def main(argv=None) -> int:
                  args.publish)
     for m in args.modules:
         research(forge_for, m, args.properties, args.workers, unsafe=args.unsafe_target, publish_results=args.publish)
+        talk_upstream()
     while args.auto or args.forever:
         for m in next_targets(args.auto or 5):
             try:

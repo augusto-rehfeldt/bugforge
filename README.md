@@ -52,37 +52,46 @@ picks and mathforge's unattended defaults are unchanged.
   model calls. After a report is filed upstream, `--link FOLDER URL` records it
   in the folder's `result.json` and the index links it. The tracker search uses
   `GITHUB_TOKEN`, else the `gh` CLI's login (30 searches a minute instead of 10).
-- **After filing.** `--track` reads the upstream issue of every linked result: new
+- **After filing.** A report you filed by hand is found without being told: an issue
+  (or pull request) of yours on python/cpython that mentions bugforge and names the
+  result's folder, or the target of exactly one unlinked result, is linked to that
+  result. `--link FOLDER URL` does it by hand when two results fit. From then on the
+  thread is read after every module of a hunt (`--track` reads it on demand): new
   comments are printed and appended to `bug_output/responses.md`, the index shows
   the issue's state and comment count, and the thread is kept in the run's
-  `state.json`. A `--publish` run does this after every module, so a `--forever
-  --publish` hunt notices replies on its own. `--fix RUN ID` (say `--fix
-  statistics-20261003-010644 c1`) asks the work model for a patch to the module's
-  own source, with the maintainers' comments as constraints, and keeps it only if
-  the reproducer stops confirming the bug and the module's stdlib test suite fails
-  nothing it passed before. It writes `cN_fix.diff` and, for a tracked thread, a
-  draft `cN_reply.md` into the run directory. Neither command posts a comment.
-- **The conversation loop.** `--converse` takes one turn in every tracked thread,
-  and under `--auto` / `--forever` it does so after every module, so a thread is
-  followed until it ends. Whose turn it is comes from the thread itself: when the
-  last comment is yours, it waits. A new comment from someone else is read once
-  by the work model, which answers one of four things. `CHANGES` (a question, a
-  requested measurement, another design, even inside a refusal): a fresh `--fix`
-  with that comment as a constraint, and a drafted reply. `APPROVED` (a maintainer
-  agreed and none of their questions is open): the loop ends and it says what to
-  do about the linked pull requests, `gh pr reopen` for your own closed one, a new
-  one when the linked one is someone else's. `REJECTED` (a maintainer dismissed
-  the idea as a whole and asked or proposed nothing): the loop ends, no reply.
-  `WAIT`: nothing to answer. A later comment reopens the loop from any of these.
-  Replies are only drafted unless you add `--post`, which sends them as you
-  through `gh`, with a line saying bugforge wrote them, at most 5 per issue, and
-  never when no patch passed its gates: then it asks for a person. It never opens
-  or reopens a pull request itself. A fix needs a pure-Python module; the draft reply is told
-  to say which measurements were not run.
-- **Nothing is filed upstream automatically.** A `bug` gets a drafted issue in `report.md`: environment,
-  documented behavior, expected and actual results, reproducer and its output.
-  Maintainers already get too many AI reports, so a person runs the reproducer
-  and checks the tracker before filing.
+  `state.json`. A pull request you opened for the issue is part of the thread: its
+  comments, reviews and review remarks are read too. Someone else's pull request
+  is listed but not followed.
+- **The conversation loop.** Every hunt takes one turn in every thread after each
+  module, with no flag; `--converse` takes the turns now and exits. Whose turn it is
+  comes from the thread itself: when the last comment by a person is yours, it
+  waits, and a bot's note never makes it your turn. A new comment from someone else
+  is read once by the work model, which answers one of four things. `CHANGES` (a
+  question, a requested measurement, another design, even inside a refusal): a
+  fresh fix with that comment as a constraint, and a reply posted as you through
+  `gh`, where the comment was made. `APPROVED` (a maintainer agreed and none of
+  their questions is open): the loop ends and it says what to do about the linked
+  pull requests, `gh pr reopen` for your own closed one, a new one when the linked
+  one is someone else's. `REJECTED` (a maintainer dismissed the idea as a whole and
+  asked or proposed nothing): the loop ends, no reply. `WAIT`: nothing to answer. A
+  later comment reopens the loop from any of these. Each posted reply ends with a
+  line saying bugforge wrote and posted it, there are at most 5 per issue, and
+  none goes out when no patch passed its gates: then it asks for a person.
+  `--no-post` drafts the replies into the run directory instead. Before the first
+  `--publish` there is nothing to follow and nothing happens.
+- **Fixes.** `--fix RUN ID` (say `--fix statistics-20261003-010644 c1`) is the fix
+  step on its own: the work model patches the module's own source, with the
+  maintainers' comments as constraints, and the patch is kept only if the
+  reproducer stops confirming the bug and the module's stdlib test suite fails
+  nothing it passed before. It writes `cN_fix.diff` and, for a followed thread, a
+  draft `cN_reply.md`, and posts nothing. A fix needs a pure-Python module, and
+  the reply is told to say which measurements were not run.
+- **No issue or pull request is opened automatically.** A `bug` gets a drafted issue
+  in `report.md`: environment, documented behavior, expected and actual results,
+  reproducer and its output. Maintainers already get too many AI reports, so a
+  person runs the reproducer and checks the tracker before filing, and a person
+  opens or reopens the pull request. Only replies in a thread you started are
+  automatic.
 - **No unsafe targets.** Generated scripts run unsandboxed in the run directory,
   as in mathforge. `check_target` refuses modules that touch files, processes,
   the network or deserialization (`DENIED`). `AUTO_TARGETS` lists only

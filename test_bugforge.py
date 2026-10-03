@@ -12,6 +12,8 @@ import seqforge
 
 _real_gh_token = bf._gh_token
 bf._gh_token = lambda: ""  # offline: the search tests must not ask the gh CLI for a login
+bf._login = lambda: "me"
+bf.RESULTS_CHECKOUT = Path(tempfile.mkdtemp()) / "absent"  # a hunt under test must not talk to real threads
 
 
 class StubAI:
@@ -446,7 +448,8 @@ class BugforgePublishTest(unittest.TestCase):
         self.assertIn("posted by [bugforge]", (run.path / "c1_reply.md").read_text(encoding="utf-8"))
         self.assertEqual(turn(), "replied")  # the same comment is never answered twice
         talk["comments"].append(said("me", "d2", "Not measured yet."))
-        self.assertEqual(turn(), "waiting")  # our comment is the last one: their move, no model call
+        talk["comments"].append({**said("cla-bot", "d2b", "sign the CLA"), "role": "BOT"})
+        self.assertEqual(turn(), "waiting")  # our comment is the last human one: their move, no model call
         self.assertEqual((len(ai.prompts), len(posted)), (3, 1))
         talk["comments"].append(said("m", "d3", "we will not change this"))
         ai.replies.append('{"verdict": "REJECTED", "reasoning": "dismissed as a whole"}')
@@ -459,8 +462,57 @@ class BugforgePublishTest(unittest.TestCase):
         self.assertEqual(len([c for c in self.calls if c[:3] == ("gh", "issue", "comment")]), 1)
         talk["comments"].append(said("m", "d5", "also handle negatives?"))
         ai.replies += ['{"verdict": "CHANGES", "reasoning": "asks"}', block, "Will do."]
-        self.assertEqual(turn(post=False), "changes")  # without --post the draft stays on disk
+        self.assertEqual(turn(post=False), "changes")  # --no-post: the draft stays on disk
         self.assertEqual(len([c for c in self.calls if c[:3] == ("gh", "issue", "comment")]), 1)
+        talk["comments"].append({**said("m", "d6", "use fabs here"), "where": "https://github.com/o/r/pull/7"})
+        ai.replies += ['{"verdict": "CHANGES", "reasoning": "asks"}', block, "Done."]
+        self.assertEqual(turn(), "replied")  # answered where it was said: on our pull request
+        self.assertEqual(self.calls[-1][3], "https://github.com/o/r/pull/7")
+        self.assertIn("on pull request https://github.com/o/r/pull/7", ai.prompts[-3])
+
+    def test_filed_reports_are_found_and_a_pull_request_of_ours_joins_the_thread(self):
+        def result(folder, target, upstream=None):
+            (self.checkout / folder).mkdir()
+            (self.checkout / folder / "result.json").write_text(json.dumps(
+                {"folder": folder, "target": target, "upstream": upstream, "title": "t"}), encoding="utf-8")
+        result("heapq-x-c1", "heapq.merge")
+        result("csv-y-c2", "csv.DictReader")
+        result("csv-z-c1", "csv.DictReader")
+        result("requests-c1", "requests.get")  # not the standard library: its tracker is unknown
+        issue = lambda n, body, pr=False: {"html_url": f"https://github.com/python/cpython/{'pull' if pr else 'issues'}/{n}",  # noqa: E731
+                                           "title": "x", "body": body, **({"pull_request": {}} if pr else {})}
+        found = {"items": [issue(9, "fix for heapq.merge, bugforge", pr=True), issue(1, "heapq.merge breaks; bugforge"),
+                           issue(2, "csv.DictReader is stale; bugforge"), issue(3, "see csv-z-c1; bugforge"),
+                           issue(4, "heapq.merge_all is unrelated; bugforge")]}
+        with mock.patch.object(bf, "github", return_value=found) as get, mock.patch.object(bf.mf, "log") as log:
+            self.assertEqual(bf.discover(self.checkout, "me"), 2)
+        self.assertIn("author%3Ame+bugforge", get.call_args[0][0])
+        upstream = lambda folder: json.loads((self.checkout / folder / "result.json").read_text(encoding="utf-8"))["upstream"]  # noqa: E731
+        self.assertEqual(upstream("heapq-x-c1"), "[cpython#1](https://github.com/python/cpython/issues/1)")
+        self.assertEqual(upstream("csv-z-c1"), "[cpython#3](https://github.com/python/cpython/issues/3)")
+        self.assertIsNone(upstream("csv-y-c2"))  # issue 2 fits two results: a person links it
+        self.assertTrue(any("fits 2 results" in c[0][0] for c in log.call_args_list))
+
+        def api(url):
+            if url.endswith("/issues/1"):
+                return {"state": "open", "comments": 1, "user": {"login": "me"}, "body": "Linked PRs\n* gh-7\n* gh-8"}
+            if url.endswith("/pulls/7"):
+                return {"user": {"login": "me"}, "html_url": "https://github.com/python/cpython/pull/7", "state": "open"}
+            if url.endswith("/pulls/8"):
+                return {"user": {"login": "other"}, "html_url": "https://github.com/python/cpython/pull/8", "state": "closed"}
+            m = {"login": "m"}
+            return {"issues/1/comments": [{"user": {"login": "cla", "type": "Bot"}, "created_at": "d1", "body": "sign"}],
+                    "issues/7/comments": [],
+                    "pulls/7/reviews": [{"user": m, "author_association": "MEMBER", "state": "CHANGES_REQUESTED",
+                                         "submitted_at": "d3", "body": ""}],
+                    "pulls/7/comments": [{"user": m, "author_association": "MEMBER", "created_at": "d2",
+                                          "path": "Lib/heapq.py", "body": "use fabs"}]}[url.split("/cpython/")[1].split("?")[0]]
+        with mock.patch.object(bf, "github", side_effect=api):
+            talk = bf.conversation("https://github.com/python/cpython/issues/1", "me")
+        self.assertEqual([(c["role"], c["body"], c.get("where", "")[-6:]) for c in talk["comments"]],
+                         [("BOT", "sign", ""), ("MEMBER", "[on Lib/heapq.py] use fabs", "pull/7"),
+                          ("MEMBER", "[review: changes_requested] ", "pull/7")])  # pull 8 is not ours: left out
+        self.assertEqual([p["author"] for p in talk["prs"]], ["me", "other"])
 
     def test_gh_login_is_the_fallback_search_token(self):
         self.calls.clear()
