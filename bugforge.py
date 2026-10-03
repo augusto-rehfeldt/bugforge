@@ -454,7 +454,8 @@ def publish_one(run, r: dict) -> dict:
     try:
         with _REPO_LOCK:
             repo, checkout = _checkout()
-            folder = checkout / f"{module}-{r['id']}"
+            # cached URLs keep the folders published as `<module>-cN` before runs got their own
+            folder = checkout / f"{run.path.name}-{r['id']}"
             folder.mkdir(exist_ok=True)
             for name in (f"{r['id']}_repro.py", f"{r['id']}_falsify.py"):
                 if (run.path / name).exists():

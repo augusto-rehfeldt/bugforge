@@ -235,10 +235,10 @@ class BugforgePublishTest(unittest.TestCase):
         with mock.patch.object(bf.shutil, "which", return_value="x"):
             got = bf.publish(run, [bug, held])
             again = bf.publish(run, [bug, held])
-        self.assertEqual([g["url"] for g in got], ["https://github.com/u/bugforge-results/tree/main/statistics-c1"])
+        self.assertEqual([g["url"] for g in got], ["https://github.com/u/bugforge-results/tree/main/statistics-20261003-010644-c1"])
         self.assertEqual(again, got)
         self.assertEqual(sum(1 for c in self.calls if c[:2] == ("git", "push")), 1)
-        folder = self.checkout / "statistics-c1"
+        folder = self.checkout / "statistics-20261003-010644-c1"
         self.assertIn("import statistics", (folder / "README.md").read_text(encoding="utf-8"))
         self.assertTrue((folder / "c1_repro.py").exists())
         index = (self.checkout / "README.md").read_text(encoding="utf-8")
