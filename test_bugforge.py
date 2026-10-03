@@ -154,5 +154,52 @@ class BugforgeTest(unittest.TestCase):
         self.assertEqual(bf.next_targets(1), [m for m in bf.AUTO_TARGETS if m != "fractions"][:1])
 
 
+
+class BugforgeRobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        patcher = mock.patch.object(bf, "OUTPUT_ROOT", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_single_class_modules_still_get_disjoint_slices(self):
+        names = bf._names("fractions")
+        self.assertIn("Fraction.limit_denominator", names)
+        self.assertGreater(len(names), 4)
+
+    def test_a_damaged_old_state_does_not_stop_new_runs(self):
+        (self.tmp / "fractions-old").mkdir()
+        (self.tmp / "fractions-old" / "state.json").write_text("{broken", encoding="utf-8")
+        self.assertEqual(bf.earlier_properties("fractions", self.tmp / "new"), [])
+
+    def test_github_rate_limit_is_waited_out_once(self):
+        import io
+        import urllib.error
+        limited = urllib.error.HTTPError("u", 403, "rate limit exceeded", {"Retry-After": "7"}, io.BytesIO(b""))
+        ok = mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b'{"items": []}'
+        sleeps = []
+        with mock.patch.object(bf.urllib.request, "urlopen", side_effect=[limited, ok]), \
+                mock.patch.object(bf.time, "sleep", sleeps.append):
+            self.assertEqual(bf.github("https://api.github.com/search/issues?q=x"), {"items": []})
+        self.assertIn(7, sleeps)
+
+    def test_an_incomplete_tracker_check_is_said_in_the_draft(self):
+        bug = {"id": "c1", "title": "t", "target": "statistics.kde", "statement": "p", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED"), "judge": {"verdict": "BUG"},
+               "duplicates": {"hits": [], "errors": ["kde overflow: HTTPError 403"]}}
+        self.assertIn("tracker search was incomplete", bf.report("statistics", [bug]))
+
+    def test_fixed_query_ignores_apostrophes(self):
+        ai = StubAI(['{"queries": []}'])
+        run = bf.mf.Run(self.tmp / "q")
+        run.data["module"] = "statistics"
+        forge = bf.BugForge(ai, run, None, search=True)
+        with mock.patch.object(bf, "github", return_value={"items": []}) as get:
+            forge.duplicates({"target": "statistics.kde", "statement": "p",
+                              "spec_basis": "Python's docs say: \"Create a continuous probability density function\""})
+        self.assertIn("Create+a+continuous", get.call_args_list[0][0][0])
+
+
 if __name__ == "__main__":
     unittest.main()

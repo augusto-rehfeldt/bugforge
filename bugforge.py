@@ -31,7 +31,9 @@ import os
 import platform
 import re
 import sys
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -85,23 +87,53 @@ def earlier_properties(module: str, current: Path) -> list:
     found = []
     for state in sorted(OUTPUT_ROOT.glob(f"{module}-*/state.json")):
         if state.parent.resolve() != current.resolve():
-            data = json.loads(state.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(state.read_text(encoding="utf-8"))
+            except (OSError, ValueError):  # a damaged old run must not stop new ones
+                continue
             found += [f"{r.get('target', '')}: {r.get('statement', '')}"[:200] for r in data.get("results") or []]
     return found[-30:]
 
 
+_GITHUB_LOCK = threading.Lock()
+_GITHUB_LAST = [0.0]
+
+
 def github(url: str) -> dict:
+    """GitHub search, spaced under its per-minute limit across threads, one retry on a limit reply.
+
+    ponytail: spacing is per process; two bugforge processes at once can still hit the limit.
+    """
     headers = {"User-Agent": mf.USER_AGENT, "Accept": "application/vnd.github+json"}
     if os.getenv("GITHUB_TOKEN"):  # 30 searches a minute instead of 10; sent only to api.github.com
         headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
-        return json.loads(response.read().decode("utf-8", "replace"))
+    gap = 2.0 if os.getenv("GITHUB_TOKEN") else 6.0
+    for attempt in range(2):
+        with _GITHUB_LOCK:
+            time.sleep(max(0.0, _GITHUB_LAST[0] + gap - time.time()))
+            _GITHUB_LAST[0] = time.time()
+            try:
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                    return json.loads(response.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (403, 429) or attempt:
+                    raise
+                wait = (exc.headers or {}).get("Retry-After", "")
+                time.sleep(min(int(wait), 120) if str(wait).isdigit() else 60)
 
 
 def _names(module: str) -> list:
     mod = importlib.import_module(module)
     names = getattr(mod, "__all__", None) or [n for n in dir(mod) if not n.startswith("_")]
-    return [n for n in names if callable(getattr(mod, n, None)) and not inspect.ismodule(getattr(mod, n))]
+    out = []
+    for n in names:
+        obj = getattr(mod, n, None)
+        if not callable(obj) or inspect.ismodule(obj):
+            continue
+        out.append(n)
+        if inspect.isclass(obj):  # `fractions` is one class: its methods are what to divide up
+            out += [f"{n}.{a}" for a in vars(obj) if not a.startswith("_") and callable(getattr(obj, a, None))]
+    return out
 
 
 def api(module: str, limit: int = 12000) -> str:
@@ -245,7 +277,8 @@ class BugForge(mf.Forge):
         queries = [queries] if isinstance(queries, str) else [str(q) for q in queries or []][:3]
         # long model phrasings missed cpython#155052; the bare name plus the documented words found it
         name = c.get("target", "").rsplit(".", 1)[-1]
-        quoted = re.search(r"['\"“‘`]([^'\"”’`]{8,80})", c.get("spec_basis", ""))
+        # a quote mark not inside a word: "Python's docs" is no quotation
+        quoted = re.search(r"(?<!\w)['\"“‘`]([^'\"”’`]{8,80})", c.get("spec_basis", ""))
         fixed = f'{name} "{" ".join(quoted.group(1).split()[:6])}"' if quoted else name
         hits, errors = [], []
         for q in [fixed] + queries:
@@ -345,6 +378,8 @@ def report(module: str, results: list) -> str:
                     f"**Documented behaviour:** {r.get('spec_basis', '')}", "",
                     f"**Expected:** {j.get('expected', '')}", "", f"**Actual:** {j.get('actual', '')}", "",
                     "**Reproducer:**", "", "```python", r["repro"]["code"].strip(), "```", "",
+                    *([f"WARNING: the tracker search was incomplete ({'; '.join(r['duplicates']['errors'])}); "
+                       "search it by hand before filing.", ""] if (r.get("duplicates") or {}).get("errors") else []),
                     "**Output:**", "", "```", r["repro"]["output"].strip()[-1500:], "```", "",
                     f"Judge: {j.get('verdict')} ({j.get('severity', '')}) -- {j.get('reasoning', '')}", ""]
         elif r["status"] == "not-a-bug":
