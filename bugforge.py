@@ -24,13 +24,16 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
+import importlib.util
 import inspect
 import json
 import os
 import platform
+import re
 import sys
 import time
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,24 +45,63 @@ import mathforge as mf  # noqa: E402
 
 OUTPUT_ROOT = Path(os.getenv("BUGFORGE_OUTPUT") or HERE / "bug_output")
 # pure-computation stdlib modules with precise documentation: a promise to test, no side effects
-AUTO_TARGETS = ("fractions", "decimal", "statistics", "difflib", "textwrap", "ipaddress", "json", "colorsys",
-                "calendar", "datetime", "urllib.parse", "shlex", "base64", "html", "html.parser", "string",
-                "email.utils", "email.headerregistry", "configparser", "csv", "heapq", "bisect", "itertools",
-                "math", "cmath", "random", "unicodedata", "zlib", "graphlib", "tomllib", "fnmatch",
-                "textwrap", "reprlib", "pprint", "plistlib", "quopri", "uu", "wave", "struct", "operator")
+AUTO_TARGETS = tuple(m for m in (
+    "fractions", "decimal", "statistics", "difflib", "textwrap", "ipaddress", "json", "colorsys", "calendar",
+    "datetime", "urllib.parse", "shlex", "base64", "html", "html.parser", "string", "email.utils",
+    "email.headerregistry", "configparser", "csv", "heapq", "bisect", "itertools", "math", "cmath", "random",
+    "unicodedata", "zlib", "graphlib", "tomllib", "fnmatch", "reprlib", "pprint", "plistlib", "quopri", "wave",
+    "struct", "operator") if importlib.util.find_spec(m))  # a module removed from this Python is no target
 # fuzzing these could delete files, start processes, talk to the network or run code
 DENIED = ("os", "shutil", "subprocess", "socket", "tempfile", "signal", "multiprocessing", "ctypes",
           "urllib.request", "http", "ftplib", "smtplib", "poplib", "imaplib", "asyncio", "webbrowser", "ssl",
           "sqlite3", "pathlib", "glob", "zipfile", "tarfile", "dbm", "shelve", "pty", "winreg", "msvcrt", "sys",
           "builtins", "importlib", "pickle", "marshal", "code", "runpy", "threading", "concurrent", "io",
           "logging", "mmap", "select", "selectors", "venv", "ensurepip", "site", "sysconfig", "gc", "atexit")
-STATUSES = ("bug", "doc-bug", "duplicate", "not-a-bug", "holds", "inconclusive", "error")
 GITHUB_SEARCH = "https://api.github.com/search/issues?"
 
 
-def check_target(module: str) -> None:
+def check_target(module: str, unsafe: bool = False) -> None:
+    """AUTO_TARGETS only: importing a module runs it (`antigravity` opens a browser), and a
+    denylist cannot name every private or platform module that starts processes."""
     if any(module == d or module.startswith(d + ".") for d in DENIED):
         raise ValueError(f"{module}: refused, its functions have side effects outside the run directory")
+    if not unsafe and module not in AUTO_TARGETS:
+        raise ValueError(f"{module}: not a vetted target; pass --unsafe-target once you know importing and "
+                         "calling it touches no files, processes or network")
+
+
+def one_per_target(props: list) -> list:
+    """Independent proposers converge on the same function; one hunt per target is enough."""
+    seen, kept = set(), []
+    for c in props:
+        if c.get("target") not in seen:
+            seen.add(c.get("target"))
+            kept.append(c)
+    return kept
+
+
+def earlier_properties(module: str, current: Path) -> list:
+    """Properties hunted in this module's earlier runs, so a new run does not repeat them."""
+    found = []
+    for state in sorted(OUTPUT_ROOT.glob(f"{module}-*/state.json")):
+        if state.parent.resolve() != current.resolve():
+            data = json.loads(state.read_text(encoding="utf-8"))
+            found += [f"{r.get('target', '')}: {r.get('statement', '')}"[:200] for r in data.get("results") or []]
+    return found[-30:]
+
+
+def github(url: str) -> dict:
+    headers = {"User-Agent": mf.USER_AGENT, "Accept": "application/vnd.github+json"}
+    if os.getenv("GITHUB_TOKEN"):  # 30 searches a minute instead of 10; sent only to api.github.com
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        return json.loads(response.read().decode("utf-8", "replace"))
+
+
+def _names(module: str) -> list:
+    mod = importlib.import_module(module)
+    names = getattr(mod, "__all__", None) or [n for n in dir(mod) if not n.startswith("_")]
+    return [n for n in names if callable(getattr(mod, n, None)) and not inspect.ismodule(getattr(mod, n))]
 
 
 def api(module: str, limit: int = 12000) -> str:
@@ -111,13 +153,19 @@ def environment(module: str) -> str:
 class BugForge(mf.Forge):
     def propose_one(self, module: str, nth: int, count: int):
         """One property per call, on the review model, cached like mathforge's proposals."""
+        # the same prompt sent to every proposer brought back the same property four times
+        names = _names(module)
+        mine = names[nth - 1::count] or names
+        earlier = earlier_properties(module, self.run.path)
         try:
             got = self.run.stage(f"conjecture{nth}", lambda: self.ask_json(
                 f"You are a senior engineer hunting real bugs in the Python module `{module}`.\n"
                 f"Environment: {environment(module)}\n\nPUBLIC API:\n{api(module)}\n\n"
                 f"SOURCE (may be truncated):\n```python\n{source(module)}\n```\n\n"
-                f"You are proposer {nth} of {count}, working independently; pick a function or area the "
-                "others are unlikely to pick. Propose exactly ONE property that the module's DOCUMENTATION "
+                f"YOUR ASSIGNED NAMES (pick your target among these or their methods): {', '.join(mine)}\n\n"
+                + ("ALREADY HUNTED IN EARLIER RUNS (do not propose these or variants of them):\n"
+                   + "\n".join(f"- {p}" for p in earlier) + "\n\n" if earlier else "")
+                + "Propose exactly ONE property that the module's DOCUMENTATION "
                 "promises (a round trip, an invariant, agreement with a mathematical definition, a "
                 "documented exception and nothing else, idempotence, consistency between two functions) "
                 "and that you suspect the code breaks on some input: edge cases in the source, unusual "
@@ -130,7 +178,7 @@ class BugForge(mf.Forge):
                 'inputs, including the edge cases to stress", "why_suspect": "what in the source makes '
                 'you think it fails"}',
                 "statement", model_type="review"))
-            return got if got.get("statement") else None
+            return dict(got) if got.get("statement") else None  # propose() adds an id; keep the cache clean
         except Exception as exc:
             mf.vlog(f"proposer {nth}/{count} produced nothing: {type(exc).__name__}: {exc}")
             with self.run.lock:
@@ -184,47 +232,67 @@ class BugForge(mf.Forge):
 
     def duplicates(self, c: dict) -> dict:
         """Existing issues that may already report it: the project's tracker for the stdlib."""
-        top = c.get("target", "").split(".")[0]
-        repo = " repo:python/cpython" if top in sys.stdlib_module_names else ""
+        # the module, not the model-written target: "Fraction.limit_denominator" is no module name
+        module = self.run.data.get("module") or c.get("target", "")
+        repo = " repo:python/cpython" if module.split(".")[0] in sys.stdlib_module_names else ""
         try:
             queries = self.ask_json(
                 f"Write 3 short GitHub issue-search queries (3-6 words each) that would find an existing "
                 f"report of this bug.\nTARGET: {c.get('target', '')}\nPROPERTY: {c['statement']}\n\n"
                 'Return ONLY JSON: {"queries": ["...", "...", "..."]}', "queries", model_type="review")["queries"]
         except ValueError:
-            queries = [c.get("target", "")]
+            queries = []
+        queries = [queries] if isinstance(queries, str) else [str(q) for q in queries or []][:3]
+        # long model phrasings missed cpython#155052; the bare name plus the documented words found it
+        name = c.get("target", "").rsplit(".", 1)[-1]
+        quoted = re.search(r"['\"“‘`]([^'\"”’`]{8,80})", c.get("spec_basis", ""))
+        fixed = f'{name} "{" ".join(quoted.group(1).split()[:6])}"' if quoted else name
         hits, errors = [], []
-        for q in [str(q) for q in queries][:3]:
-            url = GITHUB_SEARCH + urllib.parse.urlencode({"q": f"{q} is:issue{repo}", "per_page": 5})
+        for q in [fixed] + queries:
+            # pull requests too: a merged fix is the strongest sign it is already handled
+            url = GITHUB_SEARCH + urllib.parse.urlencode({"q": q + repo, "per_page": 8})
             try:
-                items = json.loads(mf._http_get(url)).get("items") or []
+                items = github(url).get("items") or []
             except Exception as exc:  # rate limited (10/min unauthenticated) or offline
-                errors.append(f"{q}: {type(exc).__name__}")
+                errors.append(f"{q}: {type(exc).__name__}: {exc}")
                 continue
-            hits += [{"title": i.get("title", ""), "url": i.get("html_url", ""), "state": i.get("state", ""),
-                      "body": (i.get("body") or "")[:600]} for i in items]
-        return {"queries": queries, "hits": hits, "errors": errors}
+            for i in items:
+                pr = i.get("pull_request")
+                body = i.get("body") or ""
+                body = body.split("</details>", 1)[-1]  # cpython's bpo-migration header says nothing
+                hits.append({"title": i.get("title", ""), "url": i.get("html_url", ""),
+                             "kind": "pull request" if pr else "issue",
+                             "state": "merged" if pr and pr.get("merged_at") else i.get("state", ""),
+                             "body": body.strip()[:600]})
+        return {"queries": [fixed] + queries, "hits": hits, "errors": errors}
 
     def judge(self, c: dict, repro: dict, dupes: dict) -> dict:
-        hits = "\n\n".join(f"[{h['state']}] {h['title']}\n{h['url']}\n{h['body']}" for h in dupes["hits"]) or "(none)"
+        """On the work model: the reproducer came from the review model, so the verdict is a
+        model reading evidence it did not produce."""
+        hits = "\n\n".join(f"[{h.get('kind', 'issue')}, {h['state']}] {h['title']}\n{h['url']}\n{h['body']}"
+                           for h in dupes["hits"]) or "(none)"
+        failed = "\n".join(dupes.get("errors") or [])
         return self.ask_json(
             "Decide whether a reproduced behaviour is a bug worth reporting. You did not write the "
             "reproducer; read its code and output yourself.\n\n"
             f"TARGET: {c.get('target', '')}\nENVIRONMENT: {environment(c.get('target', ''))}\n"
             f"CLAIMED PROPERTY: {c['statement']}\nDOCUMENTATION CITED: {c.get('spec_basis', '')}\n\n"
             f"REPRODUCER:\n```python\n{repro['code']}\n```\nOUTPUT:\n{repro['output'][-2000:]}\n\n"
-            f"EXISTING ISSUES FOUND ({len(dupes['hits'])}):\n{hits}\n\n"
-            "Be harsh. NOT_A_BUG if the documentation does not really promise the property, the input "
+            f"EXISTING ISSUES AND PULL REQUESTS FOUND ({len(dupes['hits'])}):\n{hits}\n\n"
+            + (f"SEARCHES THAT FAILED (the tracker was not fully checked; say so in reasoning):\n{failed}\n\n"
+               if failed else "")
+            + "Be harsh. NOT_A_BUG if the documentation does not really promise the property, the input "
             "is invalid, the expectation is computed wrongly, or the behaviour is a documented "
             "limitation (floating point rounding the docs warn about, implementation-defined order). "
-            "DUPLICATE if an issue above reports the same behaviour. DOC_BUG if the code is reasonable "
+            "DUPLICATE if an issue or pull request above reports or fixes the same behaviour, open, "
+            "closed or merged: a merged fix means it is already handled. DOC_BUG if the code is reasonable "
             "and the documentation is what is wrong. BUG only if the code breaks a clear documented "
             "promise on a valid input.\n\n"
             'Return ONLY JSON: {"verdict": "BUG"|"DOC_BUG"|"DUPLICATE"|"NOT_A_BUG", "reasoning": "...", '
             '"duplicate_of": "url or empty", "expected": "...", "actual": "...", "issue_title": "a '
             'maintainer-style title", "severity": "low"|"medium"|"high"}',
             "verdict",
-            model_type="review",
+            model_type="writing",
         )
 
 
@@ -241,6 +309,11 @@ def hunt(forge, c: dict) -> dict:
     repro = run.stage(f"{cid}.repro", lambda: forge.confirm_refutation(c, found["output"]))
     if not mf.refutation_confirmed(repro):
         return {**c, "status": "inconclusive", "falsification": found, "repro": repro}
+    # a search that failed (GitHub's 10/min limit) left the verdict blind: redo both on resume
+    if (run.data.get(f"{cid}.duplicates") or {}).get("errors"):
+        with run.lock:
+            run.data.pop(f"{cid}.duplicates", None)
+            run.data.pop(f"{cid}.judge", None)
     dupes = run.stage(f"{cid}.duplicates", lambda: forge.duplicates(c))
     verdict = run.stage(f"{cid}.judge", lambda: forge.judge(c, repro, dupes))
     status = {"BUG": "bug", "DOC_BUG": "doc-bug", "DUPLICATE": "duplicate"}.get(verdict.get("verdict"), "not-a-bug")
@@ -262,10 +335,11 @@ def report(module: str, results: list) -> str:
     for r in results:
         out += [f"## {r['id']} `{r['status']}`: {r.get('title', '')}", "", f"Target: `{r.get('target', '')}`", "",
                 f"Property: {r.get('statement', '')}", ""]
-        if r["status"] in ("bug", "doc-bug", "duplicate"):
-            j = r.get("judge") or {}
-            if j.get("duplicate_of"):
-                out += [f"Duplicate of: {j['duplicate_of']}", ""]
+        j = r.get("judge") or {}
+        if r["status"] == "duplicate":
+            out += [f"Duplicate of: {j.get('duplicate_of') or '(see judge)'}", "",
+                    f"Judge: {j.get('reasoning', '')}", ""]
+        elif r["status"] in ("bug", "doc-bug"):
             out += [f"### Draft issue: {j.get('issue_title') or r.get('title', '')}", "",
                     f"**Environment:** {environment(module)}", "",
                     f"**Documented behaviour:** {r.get('spec_basis', '')}", "",
@@ -273,6 +347,11 @@ def report(module: str, results: list) -> str:
                     "**Reproducer:**", "", "```python", r["repro"]["code"].strip(), "```", "",
                     "**Output:**", "", "```", r["repro"]["output"].strip()[-1500:], "```", "",
                     f"Judge: {j.get('verdict')} ({j.get('severity', '')}) -- {j.get('reasoning', '')}", ""]
+        elif r["status"] == "not-a-bug":
+            out += [f"Judge: {j.get('reasoning', '')}", ""]
+        elif r["status"] == "inconclusive":
+            why = (r.get("repro") or r["falsification"])["output"]
+            out += [f"Inconclusive: {mf._verdict_line(why, 300)}", ""]
         elif r["status"] == "holds":
             out += [f"Held: {mf._verdict_line(r['falsification']['output'], 200)}", ""]
         elif r.get("error"):
@@ -282,7 +361,13 @@ def report(module: str, results: list) -> str:
 
 def _index() -> list:
     path = OUTPUT_ROOT / "index.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:  # kept for a person to look at, never silently reset
+        path.rename(path.with_name(f"index.damaged-{int(time.time())}.json"))
+        return []
 
 
 def _save_index(rows: list) -> None:
@@ -301,8 +386,9 @@ def next_targets(n: int) -> list:
     return sorted(order, key=lambda m: (hunted.get(m, 0), order.index(m)))[:n]
 
 
-def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_dir: Path | None = None) -> dict:
-    check_target(module)
+def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_dir: Path | None = None,
+             unsafe: bool = False) -> dict:
+    check_target(module, unsafe)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     run = mf.Run(run_dir or OUTPUT_ROOT / f"{module}-{stamp}")
     run.data.setdefault("module", module)
@@ -310,7 +396,7 @@ def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_
     forge = forge_for(run)
     started = time.time()
     mf.rule(module)
-    props = run.stage("conjectures", lambda: forge.propose(module, properties, workers))
+    props = one_per_target(run.stage("conjectures", lambda: forge.propose(module, properties, workers)))
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(props)))) as pool:
         results = list(pool.map(lambda c: _hunt_safely(forge, c), props))
     run.data["results"] = results
@@ -337,15 +423,19 @@ def main(argv=None) -> int:
     ap.add_argument("--provider")
     ap.add_argument("--model")
     ap.add_argument("--review-model")
+    ap.add_argument("--unsafe-target", action="store_true",
+                    help="allow a module outside AUTO_TARGETS; generated scripts run unsandboxed")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
     if not (args.modules or args.auto or args.forever or args.resume):
         ap.error("give module names, --auto N, --forever or --resume DIR")
     for m in args.modules:
         try:
-            check_target(m)
+            check_target(m, args.unsafe_target)
         except ValueError as exc:
             ap.error(str(exc))
+    if args.resume and not (Path(args.resume) / "state.json").exists():
+        ap.error(f"{args.resume}: no state.json there")
     mf.VERBOSE = mf.VERBOSE or args.verbose
     sys.stdout.reconfigure(line_buffering=True)
     mf.exit_on_ctrl_c(message="stopped; finished stages are cached, --resume picks them up")
@@ -357,9 +447,9 @@ def main(argv=None) -> int:
 
     if args.resume:
         path = Path(args.resume)
-        research(forge_for, mf.Run(path).data["module"], args.properties, args.workers, run_dir=path)
+        research(forge_for, mf.Run(path).data["module"], args.properties, args.workers, path, args.unsafe_target)
     for m in args.modules:
-        research(forge_for, m, args.properties, args.workers)
+        research(forge_for, m, args.properties, args.workers, unsafe=args.unsafe_target)
     while args.auto or args.forever:
         for m in next_targets(args.auto or 5):
             try:
