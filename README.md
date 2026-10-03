@@ -10,12 +10,12 @@ Each property goes through these steps:
 | Stage | Model | Evidence |
 |---|---|---|
 | Propose | review | module API, source, docs; must quote the promise (`spec_basis`) |
+| Prior art | work | GitHub issues and PRs plus the diff of CPython `main` against the installed module; `KNOWN` stops here as `known` |
 | Falsify | work | randomized and edge-case search with an independent reference; `COUNTEREXAMPLE` / `NO COUNTEREXAMPLE` |
 | Reproduce | review | a minimal standalone script written from the witness alone; `REFUTATION CONFIRMED` / `REJECTED` |
-| Duplicates | review | GitHub issue search (`repo:python/cpython` for the stdlib) |
-| Judge | review | reads the reproducer, its output, the docs and the issues; returns `BUG` / `DOC_BUG` / `DUPLICATE` / `NOT_A_BUG` |
+| Judge | work | reads the reproducer, its output, the docs, the same issues and the `main` diff; returns `BUG` / `DOC_BUG` / `DUPLICATE` / `NOT_A_BUG` |
 
-The run statuses are `bug`, `doc-bug`, `duplicate`, `not-a-bug`, `holds` (no
+The run statuses are `bug`, `doc-bug`, `known` (stopped by prior art), `duplicate`, `not-a-bug`, `holds` (no
 counterexample: a negative result, kept), `inconclusive` and `error`.
 
 ## Usage

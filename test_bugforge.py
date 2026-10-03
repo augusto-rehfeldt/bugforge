@@ -24,9 +24,10 @@ def _ran(output, code="print()"):
 class BugforgeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        patcher = mock.patch.object(bf, "OUTPUT_ROOT", self.tmp)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for name, value in (("OUTPUT_ROOT", self.tmp), ("main_diff", lambda module: "")):  # offline
+            patcher = mock.patch.object(bf, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_modules_with_side_effects_are_refused(self):
         for name in ("os", "os.path", "shutil", "pickle", "urllib.request", "subprocess", "sys"):
@@ -71,6 +72,8 @@ class BugforgeTest(unittest.TestCase):
         c = {"id": "c1", "target": "fractions.Fraction", "statement": "p", "spec_basis": "doc"}
         forge = mock.Mock()
         forge.run = bf.mf.Run(self.tmp / "h")
+        forge.duplicates.return_value = {"queries": ["q"], "hits": [], "errors": []}
+        forge.prior.return_value = {"verdict": "NEW"}
         forge.falsify.return_value = _ran("NO COUNTEREXAMPLE after 5000 cases")
         self.assertEqual(bf.hunt(forge, c)["status"], "holds")
 
@@ -81,7 +84,6 @@ class BugforgeTest(unittest.TestCase):
 
         forge.run = bf.mf.Run(self.tmp / "h3")
         forge.confirm_refutation.return_value = _ran("REFUTATION CONFIRMED: x=1", code="import fractions")
-        forge.duplicates.return_value = {"queries": ["q"], "hits": []}
         forge.judge.return_value = {"verdict": "BUG", "expected": "e", "actual": "a"}
         r = bf.hunt(forge, c)
         self.assertEqual(r["status"], "bug")
@@ -118,10 +120,12 @@ class BugforgeTest(unittest.TestCase):
         forge.falsify.return_value = _ran("COUNTEREXAMPLE: x=1")
         forge.confirm_refutation.return_value = _ran("REFUTATION CONFIRMED: x=1")
         forge.duplicates.return_value = {"queries": ["q"], "hits": [], "errors": ["q: HTTPError"]}
+        forge.prior.return_value = {"verdict": "NEW"}
         forge.judge.return_value = {"verdict": "BUG"}
         bf.hunt(forge, c)
         bf.hunt(forge, c)
         self.assertEqual(forge.duplicates.call_count, 2)
+        self.assertEqual(forge.prior.call_count, 2)  # a blind prior-art verdict is redone too
 
     def test_judge_runs_on_the_work_model_with_search_errors(self):
         ai = StubAI(['{"verdict": "NOT_A_BUG"}'])
@@ -267,6 +271,61 @@ class BugforgePublishTest(unittest.TestCase):
         text = bf.report("statistics", [r], environment_line="Python 3.13.1 (old), standard library `statistics`")
         self.assertIn("Python 3.13.1 (old)", text)
         self.assertNotIn(bf.platform.platform(), text)
+
+
+class BugforgePriorArtTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        patcher = mock.patch.object(bf, "OUTPUT_ROOT", self.tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_known_report_stops_the_hunt_before_any_search_is_written(self):
+        forge = mock.Mock()
+        forge.run = bf.mf.Run(self.tmp / "k")
+        forge.duplicates.return_value = {"queries": ["q"], "hits": [{"url": "https://github.com/python/cpython/issues/9"}],
+                                         "errors": []}
+        forge.prior.return_value = {"verdict": "KNOWN", "known_as": "https://github.com/python/cpython/issues/9"}
+        r = bf.hunt(forge, {"id": "c1", "target": "statistics.kde", "statement": "p"})
+        self.assertEqual(r["status"], "known")
+        forge.falsify.assert_not_called()
+        self.assertIn("issues/9", bf.report("statistics", [r]))
+
+    def test_the_tracker_search_is_shared_by_both_judges(self):
+        forge = mock.Mock()
+        forge.run = bf.mf.Run(self.tmp / "s")
+        forge.duplicates.return_value = {"queries": ["q"], "hits": [], "errors": []}
+        forge.prior.return_value = {"verdict": "NEW"}
+        forge.falsify.return_value = _ran("COUNTEREXAMPLE: x=1")
+        forge.confirm_refutation.return_value = _ran("REFUTATION CONFIRMED: x=1")
+        forge.judge.return_value = {"verdict": "BUG"}
+        self.assertEqual(bf.hunt(forge, {"id": "c1", "target": "statistics.kde", "statement": "p"})["status"], "bug")
+        self.assertEqual(forge.duplicates.call_count, 1)
+
+    def test_main_branch_diff_for_stdlib_modules(self):
+        local = bf.inspect.getsource(bf.importlib.import_module("colorsys"))
+        upstream = local.replace("def rgb_to_yiq(r, g, b):", "def rgb_to_yiq(r, g, b):  # fixed upstream")
+        with mock.patch.object(bf.mf, "_http_get", return_value=upstream) as get:
+            diff = bf.main_diff("colorsys")
+        self.assertIn("Lib/colorsys.py", get.call_args[0][0])
+        self.assertIn("+def rgb_to_yiq(r, g, b):  # fixed upstream", diff)
+        with mock.patch.object(bf.mf, "_http_get", return_value=local):
+            self.assertIn("identical", bf.main_diff("colorsys"))
+        self.assertEqual(bf.main_diff("not_a_stdlib_module_xyz"), "")
+
+    def test_prior_judge_sees_hits_and_the_main_diff(self):
+        seen = {}
+        ai = StubAI([])
+        ai.generate_content = lambda prompt, **kw: seen.update(kw, prompt=prompt) or '{"verdict": "NEW"}'
+        run = bf.mf.Run(self.tmp / "p")
+        run.data["main_diff"] = "+    return 1.0  # overflow fixed"
+        forge = bf.BugForge(ai, run, None, search=False)
+        forge.prior({"target": "statistics.kde", "statement": "p"},
+                    {"hits": [{"title": "kde overflow", "url": "u", "state": "open", "kind": "issue", "body": ""}],
+                     "errors": []})
+        self.assertIn("kde overflow", seen["prompt"])
+        self.assertIn("overflow fixed", seen["prompt"])
+        self.assertEqual(seen["model_type"], "writing")
 
 
 if __name__ == "__main__":

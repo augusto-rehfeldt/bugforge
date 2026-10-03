@@ -22,6 +22,7 @@ modules that touch files, processes, the network or deserialization are refused.
 from __future__ import annotations
 
 import argparse
+import difflib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -182,6 +183,33 @@ def source(module: str, limit: int = 30000) -> str:
         return "(no Python source: a compiled module)"
 
 
+CPYTHON_MAIN = "https://raw.githubusercontent.com/python/cpython/main/Lib/"
+
+
+def main_diff(module: str, limit: int = 40000) -> str:
+    """How CPython's main branch differs from the installed stdlib module: a bug already
+    fixed upstream is not worth a search, a reproducer or a report."""
+    if module.split(".")[0] not in sys.stdlib_module_names:
+        return ""
+    try:
+        local = inspect.getsource(importlib.import_module(module))
+    except (OSError, TypeError):
+        return "(compiled module: no Python source to compare with main)"
+    path = module.replace(".", "/")
+    upstream, errors = None, []
+    for name in (f"{path}.py", f"{path}/__init__.py"):
+        try:
+            upstream = mf._http_get(CPYTHON_MAIN + name)
+            break
+        except Exception as exc:
+            errors.append(f"{name}: {type(exc).__name__}")
+    if upstream is None:
+        return f"(could not fetch main: {'; '.join(errors)})"
+    diff = "".join(difflib.unified_diff(local.splitlines(True), upstream.splitlines(True),
+                                        "installed", "main", n=2))
+    return diff[:limit] if diff else "(identical to main)"
+
+
 def environment(module: str) -> str:
     top = module.split(".")[0]
     if top in sys.stdlib_module_names:
@@ -310,6 +338,30 @@ class BugForge(mf.Forge):
                              "body": body.strip()[:600]})
         return {"queries": [fixed] + queries, "hits": hits, "errors": errors}
 
+    def prior(self, c: dict, dupes: dict) -> dict:
+        """Before any search is written: is this already reported, or already changed on main?
+        On the work model, like the final judge; the review model proposed the property."""
+        hits = "\n\n".join(f"[{h.get('kind', 'issue')}, {h['state']}] {h['title']}\n{h['url']}\n{h['body']}"
+                            for h in dupes["hits"]) or "(none)"
+        failed = "\n".join(dupes.get("errors") or [])
+        return self.ask_json(
+            "A property of a Python library is about to be tested for a bug. Decide whether that work "
+            "would be wasted because the behaviour is already known.\n\n"
+            f"TARGET: {c.get('target', '')}\nPROPERTY: {c['statement']}\n"
+            f"WHY SUSPECTED: {c.get('why_suspect', '')}\n\n"
+            f"ISSUES AND PULL REQUESTS FOUND ({len(dupes['hits'])}):\n{hits}\n\n"
+            + (f"SEARCHES THAT FAILED:\n{failed}\n\n" if failed else "")
+            + f"HOW THE UPSTREAM DEVELOPMENT BRANCH DIFFERS FROM THE INSTALLED MODULE:\n"
+            f"{self.run.data.get('main_diff') or '(not compared)'}\n\n"
+            "KNOWN if an issue or pull request above reports or fixes this behaviour (open, closed or "
+            "merged), or the upstream diff already changes the code this property is about. NEW "
+            "otherwise. A merely related issue is not enough; when unsure, say NEW.\n\n"
+            'Return ONLY JSON: {"verdict": "KNOWN"|"NEW", "known_as": "url, or the upstream change", '
+            '"reasoning": "..."}',
+            "verdict",
+            model_type="writing",
+        )
+
     def judge(self, c: dict, repro: dict, dupes: dict) -> dict:
         """On the work model: the reproducer came from the review model, so the verdict is a
         model reading evidence it did not produce."""
@@ -323,6 +375,7 @@ class BugForge(mf.Forge):
             f"CLAIMED PROPERTY: {c['statement']}\nDOCUMENTATION CITED: {c.get('spec_basis', '')}\n\n"
             f"REPRODUCER:\n```python\n{repro['code']}\n```\nOUTPUT:\n{repro['output'][-2000:]}\n\n"
             f"EXISTING ISSUES AND PULL REQUESTS FOUND ({len(dupes['hits'])}):\n{hits}\n\n"
+            f"UPSTREAM DEVELOPMENT BRANCH VS INSTALLED MODULE:\n{self.run.data.get('main_diff') or '(not compared)'}\n\n"
             + (f"SEARCHES THAT FAILED (the tracker was not fully checked; say so in reasoning):\n{failed}\n\n"
                if failed else "")
             + "Be harsh. NOT_A_BUG if the documentation does not really promise the property, the input "
@@ -341,8 +394,18 @@ class BugForge(mf.Forge):
 
 
 def hunt(forge, c: dict) -> dict:
-    """One property: falsify -> reproduce -> duplicate search -> judge."""
+    """One property: prior art -> falsify -> reproduce -> judge. The tracker search runs first,
+    so a known bug costs a search, not a search script, a reproducer and two judgements."""
     run, cid = forge.run, c["id"]
+    # a search that failed (GitHub's limit) left the verdicts blind: redo them on resume
+    if (run.data.get(f"{cid}.duplicates") or {}).get("errors"):
+        with run.lock:
+            for key in ("duplicates", "prior", "judge"):
+                run.data.pop(f"{cid}.{key}", None)
+    dupes = run.stage(f"{cid}.duplicates", lambda: forge.duplicates(c))
+    known = run.stage(f"{cid}.prior", lambda: forge.prior(c, dupes))
+    if known.get("verdict") == "KNOWN":
+        return {**c, "status": "known", "duplicates": dupes, "prior": known}
     found = run.stage(f"{cid}.falsify", lambda: forge.falsify(c))
     found = {**found, "output": mf.canon_negatives(found["output"])}
     search = mf.classify_search(found["exit_code"], found["output"])
@@ -353,12 +416,6 @@ def hunt(forge, c: dict) -> dict:
     repro = run.stage(f"{cid}.repro", lambda: forge.confirm_refutation(c, found["output"]))
     if not mf.refutation_confirmed(repro):
         return {**c, "status": "inconclusive", "falsification": found, "repro": repro}
-    # a search that failed (GitHub's 10/min limit) left the verdict blind: redo both on resume
-    if (run.data.get(f"{cid}.duplicates") or {}).get("errors"):
-        with run.lock:
-            run.data.pop(f"{cid}.duplicates", None)
-            run.data.pop(f"{cid}.judge", None)
-    dupes = run.stage(f"{cid}.duplicates", lambda: forge.duplicates(c))
     verdict = run.stage(f"{cid}.judge", lambda: forge.judge(c, repro, dupes))
     status = {"BUG": "bug", "DOC_BUG": "doc-bug", "DUPLICATE": "duplicate"}.get(verdict.get("verdict"), "not-a-bug")
     return {**c, "status": status, "falsification": found, "repro": repro, "duplicates": dupes, "judge": verdict}
@@ -395,6 +452,9 @@ def report(module: str, results: list, environment_line: str | None = None) -> s
                        "search it by hand before filing.", ""] if (r.get("duplicates") or {}).get("errors") else []),
                     "**Output:**", "", "```", r["repro"]["output"].strip()[-1500:], "```", "",
                     f"Judge: {j.get('verdict')} ({j.get('severity', '')}) -- {j.get('reasoning', '')}", ""]
+        elif r["status"] == "known":
+            p = r.get("prior") or {}
+            out += [f"Already known: {p.get('known_as', '')} -- {p.get('reasoning', '')}", ""]
         elif r["status"] == "not-a-bug":
             out += [f"Judge: {j.get('reasoning', '')}", ""]
         elif r["status"] == "inconclusive":
@@ -548,6 +608,7 @@ def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_
     forge = forge_for(run)
     started = time.time()
     mf.rule(module)
+    run.stage("main_diff", lambda: main_diff(module))
     props = one_per_target(run.stage("conjectures", lambda: forge.propose(module, properties, workers)))
     with ThreadPoolExecutor(max_workers=max(1, min(workers, len(props)))) as pool:
         results = list(pool.map(lambda c: _hunt_safely(forge, c), props))
