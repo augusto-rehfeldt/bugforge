@@ -410,17 +410,8 @@ class BugforgePublishTest(unittest.TestCase):
         run.data["c1.conversation"] = {"comments": [{"author": "m", "role": "MEMBER", "date": "d",
                                                      "body": "keep the fast path"}]}
         block = "<<<<<<< SEARCH\n    return x + x + 1\n=======\n    return {}\n>>>>>>> REPLACE"
-        ai = StubAI(["I would change the return.", block.format("x * 3"), block.format("x + x"), "Done as asked.",
-                     '{"verdict": "WAIT", "reasoning": "the benchmark is unanswered"}'])
-        with mock.patch.object(bf.mf, "log") as log:
-            fixed = bf.fix_result(bf.BugForge(ai, run, None, search=False), "c1")
-        self.assertIn("hold the pull request: the benchmark is unanswered", log.call_args_list[-1][0][0])
-        self.assertIn("m (MEMBER)", ai.prompts[4])
-        run.data["c1.conversation"]["prs"] = [{"url": "u", "author": "", "state": "closed"}]
-        ai.replies += [block.format("x + x"), "Done as asked.", '{"verdict": "APPROVED", "reasoning": "asked for the PR"}']
-        with mock.patch.object(bf.mf, "log") as log:
-            bf.fix_result(bf.BugForge(ai, run, None, search=False), "c1")
-        self.assertIn("maintainers agreed; reopen your pull request: gh pr reopen u", log.call_args_list[-1][0][0])
+        ai = StubAI(["I would change the return.", block.format("x * 3"), block.format("x + x"), "Done as asked."])
+        fixed = bf.fix_result(bf.BugForge(ai, run, None, search=False), "c1")
         self.assertEqual((fixed["status"], fixed["repairs"]), ("fixed", 2))
         self.assertIn("+    return x + x\n", (run.path / "c1_fix.diff").read_text(encoding="utf-8"))
         self.assertIn("keep the fast path", ai.prompts[0])
@@ -431,6 +422,45 @@ class BugforgePublishTest(unittest.TestCase):
             bf.fix_result(bf.BugForge(StubAI([]), run, None, search=False), "c9")
         with self.assertRaises(ValueError):
             bf.apply_edits("a = 1\na = 1\n", "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE")
+
+    def test_a_thread_is_answered_turn_by_turn_until_approved_or_turned_down(self):
+        (self.tmp / "bfturn.py").write_text("def double(x):\n    return x + x + 1\n", encoding="utf-8")
+        sys.path.insert(0, str(self.tmp))
+        self.addCleanup(sys.path.remove, str(self.tmp))
+        run = bf.mf.Run(self.tmp / "bfturn-20261003-010644")
+        repro = "import bfturn\nprint('REFUTATION REJECTED' if bfturn.double(2) == 4 else 'REFUTATION CONFIRMED')\n"
+        (run.path / "c1_repro.py").write_text(repro, encoding="utf-8")
+        bug = {"id": "c1", "target": "bfturn.double", "statement": "p", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED", code=repro), "judge": {"verdict": "BUG"}}
+        said = lambda who, date, body: {"author": who, "role": "MEMBER" if who == "m" else "NONE", "date": date, "body": body}  # noqa: E731
+        talk = {"url": "https://github.com/o/r/issues/1", "comments": [said("m", "d1", "benchmark it?")],
+                "prs": [{"url": "u", "author": "me", "state": "closed"}]}
+        run.data.update(module="bfturn", results=[bug])
+        run.data["c1.conversation"] = talk
+        block = "<<<<<<< SEARCH\n    return x + x + 1\n=======\n    return x + x\n>>>>>>> REPLACE"
+        ai = StubAI(['{"verdict": "CHANGES", "reasoning": "a benchmark was asked for"}', block, "Not measured yet."])
+        turn = lambda post=True: bf.take_turn(bf.BugForge(ai, run, None, search=False), "c1", "me", post)  # noqa: E731
+        self.assertEqual(turn(), "replied")
+        posted = [c for c in self.calls if c[:3] == ("gh", "issue", "comment")]
+        self.assertEqual(posted[0][3], "https://github.com/o/r/issues/1")
+        self.assertIn("posted by [bugforge]", (run.path / "c1_reply.md").read_text(encoding="utf-8"))
+        self.assertEqual(turn(), "replied")  # the same comment is never answered twice
+        talk["comments"].append(said("me", "d2", "Not measured yet."))
+        self.assertEqual(turn(), "waiting")  # our comment is the last one: their move, no model call
+        self.assertEqual((len(ai.prompts), len(posted)), (3, 1))
+        talk["comments"].append(said("m", "d3", "we will not change this"))
+        ai.replies.append('{"verdict": "REJECTED", "reasoning": "dismissed as a whole"}')
+        self.assertEqual(turn(), "rejected")
+        talk["comments"].append(said("m", "d4", "on second thought, send the PR"))
+        ai.replies.append('{"verdict": "APPROVED", "reasoning": "asked for the PR"}')
+        with mock.patch.object(bf.mf, "log") as log:
+            self.assertEqual(turn(), "approved")
+        self.assertIn("gh pr reopen u", log.call_args[0][0])
+        self.assertEqual(len([c for c in self.calls if c[:3] == ("gh", "issue", "comment")]), 1)
+        talk["comments"].append(said("m", "d5", "also handle negatives?"))
+        ai.replies += ['{"verdict": "CHANGES", "reasoning": "asks"}', block, "Will do."]
+        self.assertEqual(turn(post=False), "changes")  # without --post the draft stays on disk
+        self.assertEqual(len([c for c in self.calls if c[:3] == ("gh", "issue", "comment")]), 1)
 
     def test_gh_login_is_the_fallback_search_token(self):
         self.calls.clear()

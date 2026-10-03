@@ -474,20 +474,28 @@ class BugForge(mf.Forge):
         return {"status": "failed", "why": failure[-2000:], "repairs": mf.MAX_CODE_REPAIRS}
 
     def go_ahead(self, r: dict) -> dict:
-        """Have the maintainers agreed to a pull request? Read from the thread, never assumed."""
+        """Where the upstream thread stands after its latest comment: read from the thread, never assumed."""
         talk = self.run.data.get(f"{r['id']}.conversation") or {}
         prs = "\n".join(f"{p['url']} by {p['author']}: {p['state']}" for p in talk.get("prs") or []) or "(none)"
         return self.ask_json(
-            "A bug was reported upstream and a fix is ready. Decide from the thread whether the "
-            "project's maintainers have agreed that a pull request should now be opened or reopened.\n\n"
+            "A bug was reported upstream and the reporter proposed a fix. Decide from the thread what "
+            "the reporter should do after its latest comment.\n\n"
             f"REPORTER: {talk.get('reporter', '')}\nISSUE STATE: {talk.get('state', '')}\n"
             f"LINKED PULL REQUESTS:\n{prs}\n\nTHREAD (author, their role in the project, date):\n{self._thread(r)}\n\n"
             "APPROVED only if someone whose role is MEMBER, OWNER or COLLABORATOR said, after the "
             "reporter's latest proposal, that the approach is fine or asked for the pull request, and "
             "none of their questions (a benchmark, precision, a design choice, waiting for another "
-            "maintainer) is still unanswered or unacknowledged. A maintainer saying to wait, silence, "
-            "the reporter's own messages, or approval from anyone else is WAIT. When unsure, WAIT.\n\n"
-            'Return ONLY JSON: {"verdict": "APPROVED"|"WAIT", "reasoning": "..."}',
+            "maintainer) is still unanswered or unacknowledged.\n"
+            "REJECTED only if such a person dismissed the fix as a whole (not a bug, will not be "
+            "changed, closed as not planned) and asked nothing and proposed no alternative: there is "
+            "nothing left to answer.\n"
+            "CHANGES if the latest comments ask the reporter a question, request a measurement or a "
+            "test, or propose a different design, even inside a refusal of the current patch: "
+            "something the reporter can answer with a revised patch or a reply.\n"
+            "WAIT for anything else: told to wait for another maintainer, a bot's message, approval or "
+            "remarks from someone who is not a maintainer, or nothing addressed to the reporter. When "
+            "unsure between APPROVED and anything else, do not say APPROVED.\n\n"
+            'Return ONLY JSON: {"verdict": "APPROVED"|"REJECTED"|"CHANGES"|"WAIT", "reasoning": "..."}',
             "verdict")
 
     def reply(self, r: dict, fixed: dict) -> str:
@@ -899,7 +907,7 @@ def fix_result(forge, cid: str) -> dict:
     if not r or r.get("status") != "bug":
         raise ValueError(f"{cid}: no confirmed `bug` with that id in {run.path.name}")
     with run.lock:  # a new maintainer comment changes what the fix should be: never reuse the last one
-        for key in ("fix", "reply", "go_ahead"):
+        for key in ("fix", "reply"):
             run.data.pop(f"{cid}.{key}", None)
     fixed = run.stage(f"{cid}.fix", lambda: forge.fix(r))
     if fixed.get("status") != "fixed":
@@ -910,18 +918,83 @@ def fix_result(forge, cid: str) -> dict:
     if (run.data.get(f"{cid}.conversation") or {}).get("comments"):
         (run.path / f"{cid}_reply.md").write_text(
             run.stage(f"{cid}.reply", lambda: forge.reply(r, fixed)), encoding="utf-8")
-        mf.log(f"draft reply, not posted: {run.path / f'{cid}_reply.md'}", cid)
-        try:
-            verdict = run.stage(f"{cid}.go_ahead", lambda: forge.go_ahead(r))
-        except Exception as exc:  # an unreadable verdict is a wait, never a go
-            verdict = {"verdict": "WAIT", "reasoning": f"{type(exc).__name__}: {exc}"}
-        if verdict.get("verdict") == "APPROVED":
-            me = mf._gh("gh", "api", "user", "-q", ".login").stdout.strip()
-            for line in pull_request_advice(run.data[f"{cid}.conversation"], me):
-                mf.log(f"maintainers agreed; {line}", cid)
-        else:
-            mf.log(f"hold the pull request: {verdict.get('reasoning', '')[:300]}", cid)
+        mf.log(f"draft reply: {run.path / f'{cid}_reply.md'}", cid)
     return fixed
+
+
+MAX_REPLIES = 5  # our comments on one issue before a person has to take over
+REPLY_FOOTER = ("\n\n*Drafted and posted by [bugforge]({url}), an LLM tool I run. The patch behind it was "
+                "checked by running the reproducer and the module's test suite, not by me reading this reply.*\n")
+
+
+def take_turn(forge, cid: str, me: str, post: bool = False) -> str:
+    """One turn of one upstream thread; returns where it stands.
+
+    The thread is a loop with two exits. `approved`: a maintainer agreed, so the pull request can be
+    opened or reopened. `rejected`: a maintainer dismissed the idea as a whole and left nothing to
+    answer. Until one of them, every new comment that asks or proposes something (`changes`) gets a
+    fresh fix and a reply, and then it is their move (`waiting`). Whose move it is is read from the
+    thread, not judged: our own comment last means wait. Each comment is answered at most once.
+    """
+    run = forge.run
+    talk = run.data.get(f"{cid}.conversation") or {}
+    comments = talk.get("comments") or []
+    if not comments or comments[-1]["author"] == me:
+        return "waiting"
+    if run.data.get(f"{cid}.answered") == comments[-1]["date"]:  # this comment was already acted on
+        return run.data.get(f"{cid}.thread", "waiting")
+    r = next((x for x in run.data.get("results") or [] if x.get("id") == cid), None)
+    if not r:
+        return "waiting"
+    verdict = forge.go_ahead(r)  # a failure here raises: the comment stays unanswered and is retried
+    status = {"APPROVED": "approved", "REJECTED": "rejected", "CHANGES": "changes"}.get(verdict.get("verdict"), "waiting")
+    why = verdict.get("reasoning", "")[:300]
+    if status == "approved":
+        for line in pull_request_advice(talk, me):
+            mf.log(f"maintainers agreed; {line}", cid)
+    elif status == "rejected":
+        mf.log(f"upstream turned it down; no more replies: {why}", cid)
+    elif status == "waiting":
+        mf.log(f"nothing to answer yet: {why}", cid)
+    else:
+        fixed = fix_result(forge, cid) if r.get("status") == "bug" else {"why": "not a code bug"}
+        if fixed.get("status") != "fixed":
+            mf.log(f"a person has to answer {talk.get('url', '')}: no patch passed ({fixed.get('why', '')[:200]})", cid)
+        elif not post:
+            mf.log("reply drafted; --post sends it", cid)
+        elif sum(c["author"] == me for c in comments) >= MAX_REPLIES:
+            mf.log(f"a person has to answer {talk.get('url', '')}: {MAX_REPLIES} replies already sent", cid)
+        else:
+            draft = run.path / f"{cid}_reply.md"
+            draft.write_text(draft.read_text(encoding="utf-8").rstrip() + REPLY_FOOTER.format(url=BUGFORGE_URL),
+                             encoding="utf-8")
+            sent = mf._gh("gh", "issue", "comment", talk["url"], "--body-file", str(draft))
+            if sent.returncode != 0:
+                raise RuntimeError(f"gh issue comment: {(sent.stdout + sent.stderr).strip()[-300:]}")
+            mf.log(f"replied: {sent.stdout.strip()}", cid)
+            status = "replied"
+    with run.lock:
+        run.data[f"{cid}.answered"], run.data[f"{cid}.thread"] = comments[-1]["date"], status
+    run.save()
+    return status
+
+
+def converse(forge_for, post: bool = False) -> dict:
+    """One turn of every tracked upstream thread; {run/cN: status}. Run again (or under --forever)
+    it continues each thread until it is approved or rejected."""
+    track()
+    me = mf._gh("gh", "api", "user", "-q", ".login").stdout.strip()
+    if not me:
+        raise RuntimeError("gh is not logged in (gh auth login)")
+    turns = {}
+    for state in sorted(OUTPUT_ROOT.glob("*/state.json")):
+        run = mf.Run(state.parent)
+        for cid in [k.split(".")[0] for k in run.data if k.endswith(".conversation")]:
+            try:
+                turns[f"{run.path.name}/{cid}"] = take_turn(forge_for(run), cid, me, post)
+            except Exception as exc:  # one thread must not cost the others their turn
+                mf.log(f"turn failed, retried next time: {type(exc).__name__}: {exc}", cid)
+    return turns
 
 
 def _index() -> list:
@@ -1015,6 +1088,13 @@ def main(argv=None) -> int:
     ap.add_argument("--fix", nargs=2, metavar=("RUN", "ID"),
                     help="patch the bug ID (c1, c2, ...) of run directory RUN, keep the patch only if the "
                          "reproducer and the test suite pass, draft the upstream reply, and exit")
+    ap.add_argument("--converse", action="store_true",
+                    help="take one turn in every tracked upstream thread: a comment that asks or proposes "
+                         "something gets a fresh fix and a drafted reply, until a maintainer approves or turns "
+                         "the idea down; alone it exits, with --auto / --forever it repeats after every module")
+    ap.add_argument("--post", action="store_true",
+                    help=f"with --converse: post each drafted reply on the upstream issue as you (gh), at most "
+                         f"{MAX_REPLIES} per issue")
     args = ap.parse_args(argv)
     if args.track:
         mf.log(f"track: {track()} conversation(s) changed")
@@ -1036,7 +1116,9 @@ def main(argv=None) -> int:
             count += len(publish(run, run.data.get("results") or []))
         mf.log(f"publish: {count} result(s) published")
         return 0
-    if not (args.modules or args.auto or args.forever or args.resume or args.fix):
+    if args.post and not args.converse:
+        ap.error("--post only goes with --converse")
+    if not (args.modules or args.auto or args.forever or args.resume or args.fix or args.converse):
         ap.error("give module names, --auto N, --forever, --resume DIR or --publish-existing")
     for m in args.modules:
         try:
@@ -1079,6 +1161,15 @@ def main(argv=None) -> int:
         except ValueError as exc:
             ap.error(str(exc))
 
+    def talk_upstream() -> None:
+        if args.converse:
+            try:
+                for name, status in converse(forge_for, args.post).items():
+                    mf.log(f"upstream {name}: {status}")
+            except Exception as exc:  # the tracker being down must not stop the hunt
+                mf.log(f"converse failed: {type(exc).__name__}: {exc}")
+
+    talk_upstream()
     if args.resume:
         path = Path(args.resume)
         research(forge_for, module, args.properties, args.workers, path, args.unsafe_target,
@@ -1091,6 +1182,7 @@ def main(argv=None) -> int:
                 research(forge_for, m, args.properties, args.workers, publish_results=args.publish)
             except Exception as exc:
                 mf.log(f"{m} failed: {type(exc).__name__}: {exc}")
+            talk_upstream()
         if not args.forever:
             break
     return 0

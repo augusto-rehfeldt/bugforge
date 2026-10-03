@@ -61,12 +61,23 @@ picks and mathforge's unattended defaults are unchanged.
   own source, with the maintainers' comments as constraints, and keeps it only if
   the reproducer stops confirming the bug and the module's stdlib test suite fails
   nothing it passed before. It writes `cN_fix.diff` and, for a tracked thread, a
-  draft `cN_reply.md` into the run directory. It then reads the thread for a
-  go-ahead: only a maintainer agreeing with the approach, with none of their
-  questions left open, counts. On a go-ahead it says what to do about the linked
-  pull requests (`gh pr reopen` for your own closed one; another person's cannot
-  be reopened by you); otherwise it says what is still open. Neither command posts
-  a comment, or opens or reopens a pull request. A fix needs a pure-Python module; the draft reply is told
+  draft `cN_reply.md` into the run directory. Neither command posts a comment.
+- **The conversation loop.** `--converse` takes one turn in every tracked thread,
+  and under `--auto` / `--forever` it does so after every module, so a thread is
+  followed until it ends. Whose turn it is comes from the thread itself: when the
+  last comment is yours, it waits. A new comment from someone else is read once
+  by the work model, which answers one of four things. `CHANGES` (a question, a
+  requested measurement, another design, even inside a refusal): a fresh `--fix`
+  with that comment as a constraint, and a drafted reply. `APPROVED` (a maintainer
+  agreed and none of their questions is open): the loop ends and it says what to
+  do about the linked pull requests, `gh pr reopen` for your own closed one, a new
+  one when the linked one is someone else's. `REJECTED` (a maintainer dismissed
+  the idea as a whole and asked or proposed nothing): the loop ends, no reply.
+  `WAIT`: nothing to answer. A later comment reopens the loop from any of these.
+  Replies are only drafted unless you add `--post`, which sends them as you
+  through `gh`, with a line saying bugforge wrote them, at most 5 per issue, and
+  never when no patch passed its gates: then it asks for a person. It never opens
+  or reopens a pull request itself. A fix needs a pure-Python module; the draft reply is told
   to say which measurements were not run.
 - **Nothing is filed upstream automatically.** A `bug` gets a drafted issue in `report.md`: environment,
   documented behavior, expected and actual results, reproducer and its output.
