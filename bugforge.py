@@ -372,8 +372,10 @@ def _hunt_safely(forge, c: dict) -> dict:
         return {**c, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
 
-def report(module: str, results: list) -> str:
-    out = [f"# bugforge: `{module}`", "", environment(module), "",
+def report(module: str, results: list, environment_line: str | None = None) -> str:
+    """`environment_line` is the run's own, recorded when it ran; the live one is for a fresh run."""
+    env = environment_line or environment(module)
+    out = [f"# bugforge: `{module}`", "", env, "",
            "Drafted issues are not filed. Read the reproducer, run it yourself, and check the tracker before "
            "filing anything.", ""]
     for r in results:
@@ -385,7 +387,7 @@ def report(module: str, results: list) -> str:
                     f"Judge: {j.get('reasoning', '')}", ""]
         elif r["status"] in ("bug", "doc-bug"):
             out += [f"### Draft issue: {j.get('issue_title') or r.get('title', '')}", "",
-                    f"**Environment:** {environment(module)}", "",
+                    f"**Environment:** {env}", "",
                     f"**Documented behaviour:** {r.get('spec_basis', '')}", "",
                     f"**Expected:** {j.get('expected', '')}", "", f"**Actual:** {j.get('actual', '')}", "",
                     "**Reproducer:**", "", "```python", r["repro"]["code"].strip(), "```", "",
@@ -460,13 +462,16 @@ def publish_one(run, r: dict) -> dict:
             for name in (f"{r['id']}_repro.py", f"{r['id']}_falsify.py"):
                 if (run.path / name).exists():
                     shutil.copy2(run.path / name, folder / name)
-            (folder / "README.md").write_text(report(module, [r]), encoding="utf-8")
+            env = run.data.get("environment") or environment(module)
+            (folder / "README.md").write_text(
+                "*Found and written by language models (bugforge); not reviewed by a person.*\n\n"
+                + report(module, [r], env), encoding="utf-8")
             title = (r.get("judge") or {}).get("issue_title") or r.get("title", r["id"])
             meta = folder / "result.json"
             upstream = json.loads(meta.read_text(encoding="utf-8")).get("upstream") if meta.exists() else None
             meta.write_text(json.dumps({
                 "folder": folder.name, "status": r["status"], "target": r.get("target", ""), "title": title,
-                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "python": platform.python_version(),
+                "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "python": (re.match(r"Python (\S+)", env) or [None, platform.python_version()])[1],
                 "run": run.path.name, "id": r["id"], "upstream": upstream}, indent=2) + "\n", encoding="utf-8")
             (checkout / "README.md").write_text(results_index(checkout), encoding="utf-8")
             mf._gh("git", "add", "-A", cwd=checkout)
@@ -483,9 +488,16 @@ def publish(run, results: list) -> list:
     """Publish every bug and doc-bug once; the URL is cached in state.json, a failure is retried next time."""
     published = []
     for r in results:
-        if r["status"] not in PUBLISH_STATUSES:
-            continue
         key = f"{r['id']}.published"
+        if r["status"] not in PUBLISH_STATUSES:
+            stale = (run.data.get(key) or {}).get("url")
+            if stale:
+                mf.log(f"PUBLIC {stale} no longer qualifies (now `{r['status']}`); retract it", r["id"])
+            continue
+        if (r.get("duplicates") or {}).get("errors"):
+            # the judge ruled without the tracker; --resume redoes the search, then it can go out
+            mf.log("not published: the duplicate search was incomplete", r["id"])
+            continue
         info = run.data.get(key) or {}
         if not info.get("url"):
             info = publish_one(run, r)

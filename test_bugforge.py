@@ -244,6 +244,29 @@ class BugforgePublishTest(unittest.TestCase):
         index = (self.checkout / "README.md").read_text(encoding="utf-8")
         self.assertIn("statistics.kde logistic kernel overflows", index)
         self.assertIn("not filed", index)
+        readme = (folder / "README.md").read_text(encoding="utf-8")
+        self.assertIn("not reviewed by a person", readme.splitlines()[0])
+
+    def test_unchecked_duplicates_are_held_back_and_stale_urls_flagged(self):
+        run = bf.mf.Run(self.tmp / "difflib-20261003-011733")
+        run.data.update(module="difflib", environment="Python 3.13.1 (old), standard library `difflib`")
+        blind = {"id": "c2", "target": "difflib.ndiff", "statement": "p", "status": "bug",
+                 "repro": _ran("REFUTATION CONFIRMED"), "judge": {"verdict": "BUG"},
+                 "duplicates": {"hits": [], "errors": ["q: HTTPError 403"]}}
+        with mock.patch.object(bf.shutil, "which", return_value="x"):
+            self.assertEqual(bf.publish(run, [blind]), [])
+        run.data["c3.published"] = {"url": "https://github.com/u/r/tree/main/difflib-c3"}
+        stale = {"id": "c3", "target": "difflib.HtmlDiff", "statement": "q", "status": "duplicate"}
+        with mock.patch.object(bf.mf, "log") as log:
+            bf.publish(run, [stale])
+        self.assertIn("no longer qualifies", log.call_args[0][0])
+
+    def test_published_report_names_the_environment_of_the_run(self):
+        r = {"id": "c1", "target": "statistics.kde", "statement": "p", "status": "bug",
+             "repro": _ran("REFUTATION CONFIRMED"), "judge": {"verdict": "BUG"}}
+        text = bf.report("statistics", [r], environment_line="Python 3.13.1 (old), standard library `statistics`")
+        self.assertIn("Python 3.13.1 (old)", text)
+        self.assertNotIn(bf.platform.platform(), text)
 
 
 if __name__ == "__main__":
