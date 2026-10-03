@@ -632,12 +632,16 @@ def main(argv=None) -> int:
     ap.add_argument("modules", nargs="*", help="importable module names to hunt in")
     ap.add_argument("--auto", type=int, metavar="N", help="hunt in the N least-hunted modules of AUTO_TARGETS")
     ap.add_argument("--forever", action="store_true")
-    ap.add_argument("--resume", help="an existing run directory under bug_output")
+    ap.add_argument("--resume", nargs="?", const="latest",
+                    help="existing run directory; bare --resume selects the latest saved run, "
+                         "finished first with --forever")
     ap.add_argument("--properties", type=int, default=4, help="properties proposed per module")
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--provider")
     ap.add_argument("--model")
     ap.add_argument("--review-model")
+    ap.add_argument("--effort", choices=mf.EFFORTS, help="work-model reasoning effort; overrides the menu pick")
+    ap.add_argument("--review-effort", choices=mf.EFFORTS, help="review-model reasoning effort; overrides the menu pick")
     ap.add_argument("--publish", action="store_true",
                     help=f"push every bug / doc-bug to the PUBLIC GitHub repository {RESULTS_REPO} (needs gh); "
                          "files nothing upstream")
@@ -660,8 +664,23 @@ def main(argv=None) -> int:
             check_target(m, args.unsafe_target)
         except ValueError as exc:
             ap.error(str(exc))
-    if args.resume and not (Path(args.resume) / "state.json").exists():
-        ap.error(f"{args.resume}: no state.json there")
+    if args.resume == "latest":
+        path = mf.latest_run_dir(OUTPUT_ROOT)
+        if path is None:
+            ap.error(f"no previous run to resume under {OUTPUT_ROOT}")
+        args.resume = str(path)
+    if args.resume:
+        state = Path(args.resume) / "state.json"
+        if not state.exists():
+            ap.error(f"{args.resume}: no state.json there")
+        try:
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            module = saved.get("module") if isinstance(saved, dict) else None
+            if not isinstance(module, str) or not module:
+                raise ValueError("state.json has no valid module recorded")
+            check_target(module, args.unsafe_target)
+        except (OSError, ValueError) as exc:
+            ap.error(f"{args.resume}: cannot resume: {exc}")
     mf.VERBOSE = mf.VERBOSE or args.verbose
     sys.stdout.reconfigure(line_buffering=True)
     mf.exit_on_ctrl_c(message="stopped; finished stages are cached, --resume picks them up")
@@ -673,7 +692,7 @@ def main(argv=None) -> int:
 
     if args.resume:
         path = Path(args.resume)
-        research(forge_for, mf.Run(path).data["module"], args.properties, args.workers, path, args.unsafe_target,
+        research(forge_for, module, args.properties, args.workers, path, args.unsafe_target,
                  args.publish)
     for m in args.modules:
         research(forge_for, m, args.properties, args.workers, unsafe=args.unsafe_target, publish_results=args.publish)

@@ -6,6 +6,9 @@ from pathlib import Path
 from unittest import mock
 
 import bugforge as bf
+import sys
+sys.path.insert(0, str(bf.MATHFORGE.parent / "seqforge"))
+import seqforge
 
 
 class StubAI:
@@ -28,6 +31,82 @@ class BugforgeTest(unittest.TestCase):
             patcher = mock.patch.object(bf, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+
+    def test_bare_resume_selects_latest_saved_run_before_forever(self):
+        import os
+        old = bf.mf.Run(self.tmp / "old")
+        old.data.update(module="json")
+        old.save()
+        latest = bf.mf.Run(self.tmp / "completed")
+        latest.data.update(module="fractions", results=[])
+        latest.save()
+        scratch = bf.mf.Run(self.tmp / "_scratch")
+        scratch.save()
+        for run, stamp in ((old, 10), (latest, 20), (scratch, 30)):
+            os.utime(run.path / "state.json", (stamp, stamp))
+        with mock.patch.object(seqforge, "setup_ai"), mock.patch.object(bf.sys, "stdout"), \
+                mock.patch.object(bf.mf, "exit_on_ctrl_c"), mock.patch.object(bf, "research") as research, \
+                mock.patch.object(bf, "next_targets", side_effect=[["json"], KeyboardInterrupt]):
+            with self.assertRaises(KeyboardInterrupt):
+                bf.main(["--resume", "--forever"])
+        self.assertEqual(research.call_args_list[0].args[1], "fractions")
+        self.assertEqual(research.call_args_list[0].args[4], latest.path)
+        self.assertEqual(research.call_args_list[1].args[1], "json")
+
+    def test_bare_resume_without_runs_fails_before_ai_setup(self):
+        with mock.patch.object(seqforge, "setup_ai") as setup, mock.patch.object(bf.sys, "stderr"):
+            with self.assertRaises(SystemExit) as stopped:
+                bf.main(["--resume"])
+        self.assertEqual(stopped.exception.code, 2)
+        setup.assert_not_called()
+
+    def test_explicit_resume_path_is_preserved_and_efforts_are_parsed(self):
+        path = self.tmp / "older"
+        run = bf.mf.Run(path)
+        run.data.update(module="json")
+        run.save()
+        with mock.patch.object(seqforge, "setup_ai") as setup, mock.patch.object(bf.sys, "stdout"), \
+                mock.patch.object(bf.mf, "exit_on_ctrl_c"), mock.patch.object(bf, "research") as research:
+            self.assertEqual(bf.main(["--resume", str(path), "--effort", "low", "--review-effort", "high"]), 0)
+        self.assertEqual(research.call_args.args[4], path)
+        self.assertEqual((setup.call_args.args[0].effort, setup.call_args.args[0].review_effort), ("low", "high"))
+
+    def test_unusable_resume_state_fails_before_ai_setup_without_mutation(self):
+        path = self.tmp / "broken"
+        path.mkdir()
+        state = path / "state.json"
+        for content in ('{', '{}', '[]', '{"module": null}', '{"module": 7}',
+                        '{"module": ""}', '{"module": "os"}', '{"module": "antigravity"}'):
+            for resume in (["--resume"], ["--resume", str(path)]):
+                with self.subTest(content=content, resume=resume):
+                    state.write_text(content, encoding="utf-8")
+                    with mock.patch.object(seqforge, "setup_ai") as setup, \
+                            mock.patch.object(bf.sys, "stdout"), mock.patch.object(bf.sys, "stderr"), \
+                            mock.patch.object(bf.mf, "exit_on_ctrl_c"):
+                        with self.assertRaises(SystemExit) as stopped:
+                            bf.main(resume)
+                    self.assertEqual(stopped.exception.code, 2)
+                    setup.assert_not_called()
+                    self.assertEqual(state.read_text(encoding="utf-8"), content)
+
+    def test_resume_preserves_unsafe_target_opt_in(self):
+        run = bf.mf.Run(self.tmp / "unsafe")
+        run.data["module"] = "antigravity"
+        run.save()
+        with mock.patch.object(seqforge, "setup_ai"), mock.patch.object(bf.sys, "stdout"), \
+                mock.patch.object(bf.mf, "exit_on_ctrl_c"), mock.patch.object(bf, "research") as research:
+            self.assertEqual(bf.main(["--resume", str(run.path), "--unsafe-target"]), 0)
+        self.assertEqual(research.call_args.args[1], "antigravity")
+        self.assertTrue(research.call_args.args[5])
+
+    def test_invalid_efforts_fail_before_ai_setup(self):
+        for flag in ("--effort", "--review-effort"):
+            with self.subTest(flag=flag), mock.patch.object(seqforge, "setup_ai") as setup, \
+                    mock.patch.object(bf.sys, "stderr"):
+                with self.assertRaises(SystemExit) as stopped:
+                    bf.main(["json", flag, "invalid"])
+                self.assertEqual(stopped.exception.code, 2)
+                setup.assert_not_called()
 
     def test_modules_with_side_effects_are_refused(self):
         for name in ("os", "os.path", "shutil", "pickle", "urllib.request", "subprocess", "sys"):

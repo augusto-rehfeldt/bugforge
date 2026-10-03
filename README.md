@@ -24,12 +24,23 @@ counterexample: a negative result, kept), `inconclusive` and `error`.
 python bugforge.py fractions                 # one module
 python bugforge.py --auto 5 --workers 3      # the five least-hunted modules in AUTO_TARGETS
 python bugforge.py --forever --workers 3
-python bugforge.py --resume bug_output/<run>
+python bugforge.py --resume                  # latest saved run
+python bugforge.py --forever --resume        # resume first, then keep hunting
+python bugforge.py --resume bug_output/<run> # explicit older run
+python bugforge.py json --effort low --review-effort high
 python -B -m unittest -q test_bugforge       # offline checks
 ```
 
 Output goes to `bug_output/<module>-<UTC stamp>/`, which holds `state.json`, the
-scripts and `report.md`. `bug_output/index.json` records every run.
+scripts and `report.md`. `bug_output/index.json` records every run. Bare
+`--resume` selects the most recently saved `state.json`, including completed runs
+but excluding underscore-prefixed scratch directories. `BUGFORGE_OUTPUT` overrides
+the output root. No saved run means an error before provider setup.
+
+`--provider`, `--model` and `--review-model` use the shared ai-suite menu.
+`--effort` and `--review-effort` override its per-role reasoning picks; use
+`provider-default` to send no effort override. Without flags, menu/environment
+picks and mathforge's unattended defaults are unchanged.
 
 ## Rules
 
