@@ -91,6 +91,8 @@ def earlier_properties(module: str, current: Path) -> list:
                 data = json.loads(state.read_text(encoding="utf-8"))
             except (OSError, ValueError):  # a damaged old run must not stop new ones
                 continue
+            if not isinstance(data, dict):
+                continue
             found += [f"{r.get('target', '')}: {r.get('statement', '')}"[:200] for r in data.get("results") or []]
     return found[-30:]
 
@@ -116,9 +118,11 @@ def github(url: str) -> dict:
                 with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
                     return json.loads(response.read().decode("utf-8", "replace"))
             except urllib.error.HTTPError as exc:
-                if exc.code not in (403, 429) or attempt:
+                headers = exc.headers or {}
+                limited = exc.code == 429 or headers.get("Retry-After") or headers.get("X-RateLimit-Remaining") == "0"
+                if not limited or attempt:  # a 403 for a bad token is not waited out
                     raise
-                wait = (exc.headers or {}).get("Retry-After", "")
+                wait = headers.get("Retry-After", "")
                 time.sleep(min(int(wait), 120) if str(wait).isdigit() else 60)
 
 

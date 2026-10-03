@@ -170,6 +170,8 @@ class BugforgeRobustnessTest(unittest.TestCase):
     def test_a_damaged_old_state_does_not_stop_new_runs(self):
         (self.tmp / "fractions-old").mkdir()
         (self.tmp / "fractions-old" / "state.json").write_text("{broken", encoding="utf-8")
+        (self.tmp / "fractions-list").mkdir()
+        (self.tmp / "fractions-list" / "state.json").write_text("[]", encoding="utf-8")
         self.assertEqual(bf.earlier_properties("fractions", self.tmp / "new"), [])
 
     def test_github_rate_limit_is_waited_out_once(self):
@@ -183,6 +185,10 @@ class BugforgeRobustnessTest(unittest.TestCase):
                 mock.patch.object(bf.time, "sleep", sleeps.append):
             self.assertEqual(bf.github("https://api.github.com/search/issues?q=x"), {"items": []})
         self.assertIn(7, sleeps)
+        denied = urllib.error.HTTPError("u", 403, "bad credentials", {}, io.BytesIO(b""))
+        with mock.patch.object(bf.urllib.request, "urlopen", side_effect=[denied]), \
+                mock.patch.object(bf.time, "sleep", sleeps.append), self.assertRaises(urllib.error.HTTPError):
+            bf.github("https://api.github.com/search/issues?q=x")
 
     def test_an_incomplete_tracker_check_is_said_in_the_draft(self):
         bug = {"id": "c1", "title": "t", "target": "statistics.kde", "statement": "p", "status": "bug",
