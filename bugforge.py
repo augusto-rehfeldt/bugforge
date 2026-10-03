@@ -22,6 +22,7 @@ modules that touch files, processes, the network or deserialization are refused.
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import functools
 import importlib
@@ -420,6 +421,91 @@ class BugForge(mf.Forge):
         )
 
 
+    def _thread(self, r: dict) -> str:
+        talk = self.run.data.get(f"{r['id']}.conversation") or {}
+        return "\n\n".join(f"{c['author']} ({c['role']}), {c['date']}:\n{c['body']}" for c in talk.get("comments") or [])
+
+    def fix(self, r: dict) -> dict:
+        """A patch to the module's own source, kept only when the reproducer stops confirming the bug
+        and the module's test suite still passes: executed gates, not a model's opinion of its patch."""
+        module = self.run.data.get("module", "")
+        origin = str(getattr(importlib.util.find_spec(module), "origin", ""))
+        if not origin.endswith(".py"):
+            return {"status": "unfixable", "why": "no Python source (a compiled module)"}
+        original = Path(origin).read_text(encoding="utf-8")
+        if len(original) > FIX_SOURCE_LIMIT:
+            return {"status": "unfixable", "why": f"{len(original)} characters of source is more than a prompt carries"}
+        thread, j = self._thread(r), r.get("judge") or {}
+        prompt = (
+            f"You are fixing a confirmed bug in the Python module `{module}`.\n\n"
+            f"TARGET: {r.get('target', '')}\nPROPERTY BROKEN: {r['statement']}\n"
+            f"EXPECTED: {j.get('expected', '')}\nACTUAL: {j.get('actual', '')}\n\n"
+            f"REPRODUCER (it must print REFUTATION REJECTED once the module is fixed):\n```python\n"
+            f"{r['repro']['code']}\n```\nITS OUTPUT NOW:\n{r['repro']['output'][-1500:]}\n\n"
+            + (f"WHAT THE MAINTAINERS SAID ON THE UPSTREAM ISSUE (their constraints outrank your taste; "
+               f"follow a design they ask for):\n{thread}\n\n" if thread else "")
+            + f"MODULE SOURCE:\n```python\n{original}\n```\n\n"
+            "Write the smallest change a maintainer would merge: keep the fast path and the public "
+            "behaviour on every input that works today, match the surrounding style, add no "
+            "dependency. Reply with one or more blocks of exactly this form and nothing else:\n"
+            "<<<<<<< SEARCH\nlines copied verbatim from the source, enough to match exactly once\n"
+            "=======\nthe replacement lines\n>>>>>>> REPLACE"
+        )
+        try:
+            path = "Lib/" + Path(origin).relative_to(Path(os.__file__).parent).as_posix()
+        except ValueError:  # not the standard library
+            path = Path(origin).name
+        complaint = failure = ""
+        for attempt in range(mf.MAX_CODE_REPAIRS + 1):
+            reply = self.ask(prompt + complaint)
+            try:
+                patched = apply_edits(original, reply)
+                failure = check_fix(self.run, r, module, patched)
+            except ValueError as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+            if not failure:
+                diff = "".join(difflib.unified_diff(original.splitlines(True), patched.splitlines(True),
+                                                    f"a/{path}", f"b/{path}"))
+                return {"status": "fixed", "diff": diff, "repairs": attempt, "tests": _test_suite(module),
+                        "model": self.models.get("writing", "")}
+            mf.vlog(f"  fix: attempt {attempt + 1} rejected: {failure[:200]}", r["id"])
+            complaint = (f"\n\nYOUR PREVIOUS REPLY:\n{reply[-6000:]}\n\nIT WAS REJECTED:\n{failure[-3000:]}\n\n"
+                         "Reply with corrected SEARCH/REPLACE blocks against the ORIGINAL source above.")
+        return {"status": "failed", "why": failure[-2000:], "repairs": mf.MAX_CODE_REPAIRS}
+
+    def go_ahead(self, r: dict) -> dict:
+        """Have the maintainers agreed to a pull request? Read from the thread, never assumed."""
+        talk = self.run.data.get(f"{r['id']}.conversation") or {}
+        prs = "\n".join(f"{p['url']} by {p['author']}: {p['state']}" for p in talk.get("prs") or []) or "(none)"
+        return self.ask_json(
+            "A bug was reported upstream and a fix is ready. Decide from the thread whether the "
+            "project's maintainers have agreed that a pull request should now be opened or reopened.\n\n"
+            f"REPORTER: {talk.get('reporter', '')}\nISSUE STATE: {talk.get('state', '')}\n"
+            f"LINKED PULL REQUESTS:\n{prs}\n\nTHREAD (author, their role in the project, date):\n{self._thread(r)}\n\n"
+            "APPROVED only if someone whose role is MEMBER, OWNER or COLLABORATOR said, after the "
+            "reporter's latest proposal, that the approach is fine or asked for the pull request, and "
+            "none of their questions (a benchmark, precision, a design choice, waiting for another "
+            "maintainer) is still unanswered or unacknowledged. A maintainer saying to wait, silence, "
+            "the reporter's own messages, or approval from anyone else is WAIT. When unsure, WAIT.\n\n"
+            'Return ONLY JSON: {"verdict": "APPROVED"|"WAIT", "reasoning": "..."}',
+            "verdict")
+
+    def reply(self, r: dict, fixed: dict) -> str:
+        """A draft answer to the upstream thread, for a person to check and post."""
+        return self.ask(
+            "Draft a reply to the maintainers on this issue, in the reporter's voice. A person will "
+            "check it before posting.\n\n"
+            f"ISSUE: {(r.get('judge') or {}).get('issue_title') or r.get('title', '')}\n\n"
+            f"THE THREAD SO FAR:\n{self._thread(r)}\n\n"
+            f"THE PATCH NOW PROPOSED:\n```diff\n{fixed['diff']}\n```\n"
+            f"WHAT WAS RUN ON IT: the issue's reproducer no longer fails"
+            + (f"; `python -m unittest {fixed['tests']}` passes" if fixed.get("tests") else "") + ".\n\n"
+            "Answer each open question in the thread, shortly and plainly. State only what the patch "
+            "and the runs above show. Where a maintainer asks for a measurement or a build that was "
+            "not run (a benchmark, a PGO build, another platform), say it has not been run yet "
+            "instead of guessing a number. No flattery, no headings.")
+
+
 def hunt(forge, c: dict) -> dict:
     """One property: prior art -> falsify -> reproduce -> judge. The tracker search runs first,
     so a known bug costs a search, not a search script, a reproducer and two judgements."""
@@ -536,8 +622,11 @@ def results_index(checkout: Path) -> str:
              "| Date | Target | Verdict | Title | Python | Upstream |", "| --- | --- | --- | --- | --- | --- |"]
     for m in rows:
         title = m.get("title", "").replace("|", "\\|")
+        talk = m.get("conversation") or {}
+        upstream = (m.get("upstream") or "not filed") + (
+            f" ({talk.get('state', '')}, {talk.get('comments', 0)} comment(s))" if talk else "")
         lines.append(f"| {m.get('date', '')} | `{m.get('target', '')}` | {m.get('status', '')} | "
-                     f"[{title}]({m['folder']}/) | {m.get('python', '')} | {m.get('upstream') or 'not filed'} |")
+                     f"[{title}]({m['folder']}/) | {m.get('python', '')} | {upstream} |")
     return "\n".join(lines) + "\n"
 
 
@@ -631,6 +720,210 @@ def link_upstream(folder: str, url: str) -> str:
     return ""
 
 
+UPSTREAM_ISSUE = re.compile(r"github\.com/([^/\s)]+)/([^/\s)]+)/(?:issues|pull)/(\d+)")
+
+
+def conversation(url: str) -> dict:
+    """An upstream issue as its maintainers left it: state, labels and the comments.
+
+    ponytail: the first 100 comments; page when a thread outgrows that.
+    """
+    owner, name, number = UPSTREAM_ISSUE.search(url).groups()
+    api = f"https://api.github.com/repos/{owner}/{name}/issues/{number}"
+    issue = github(api)
+    comments = github(api + "/comments?per_page=100") if issue.get("comments") else []
+    prs = []
+    # CPython's bot lists `gh-N` under "Linked PRs" in the issue body
+    for n in dict.fromkeys(re.findall(r"gh-(\d+)", (issue.get("body") or "").partition("Linked PRs")[2])):
+        try:
+            pr = github(f"https://api.github.com/repos/{owner}/{name}/pulls/{n}")
+        except Exception:  # a deleted pull request must not hide the thread
+            continue
+        prs.append({"url": pr.get("html_url", ""), "author": (pr.get("user") or {}).get("login", ""),
+                    "state": "merged" if pr.get("merged") else pr.get("state", "")})
+    return {"url": f"https://github.com/{owner}/{name}/issues/{number}", "state": issue.get("state", ""),
+            "reporter": (issue.get("user") or {}).get("login", ""), "prs": prs,
+            "labels": [label.get("name", "") for label in issue.get("labels") or []],
+            "updated": issue.get("updated_at", ""),
+            "comments": [{"author": (c.get("user") or {}).get("login", ""), "role": c.get("author_association", ""),
+                          "date": c.get("created_at", ""), "body": (c.get("body") or "")[:4000]} for c in comments]}
+
+
+def track() -> int:
+    """Refresh the upstream conversation of every published result that links one; returns how many
+    changed. The index gets the state and comment count; the thread itself stays in the run's
+    state.json, where --fix reads it. Nothing is posted."""
+    changed = 0
+    with _REPO_LOCK:
+        _repo, checkout = _checkout()
+        for meta in sorted(checkout.glob("*/result.json")):
+            data = json.loads(meta.read_text(encoding="utf-8"))
+            if not UPSTREAM_ISSUE.search(data.get("upstream") or ""):
+                continue
+            try:
+                talk = conversation(data["upstream"])
+            except Exception as exc:  # one unreachable issue must not hide the others
+                mf.log(f"{meta.parent.name}: not tracked: {type(exc).__name__}: {exc}")
+                continue
+            seen = (data.get("conversation") or {}).get("comments", 0)
+            for c in talk["comments"][seen:]:
+                mf.log(f"{meta.parent.name}: new comment by {c['author']} ({c['role']}): "
+                       f"{' '.join(c['body'].split())[:300]}")
+                # the console scrolls away under --forever: every response is also kept in one local file
+                OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+                with open(OUTPUT_ROOT / "responses.md", "a", encoding="utf-8") as responses:
+                    responses.write(f"## {meta.parent.name}: {talk['url']}\n\n**{c['author']}** ({c['role']}), "
+                                    f"{c['date']}:\n\n{c['body']}\n\n")
+            if (OUTPUT_ROOT / str(data.get("run")) / "state.json").exists():
+                run = mf.Run(OUTPUT_ROOT / data["run"])
+                run.data[f"{data['id']}.conversation"] = talk
+                run.save()
+            summary = {"state": talk["state"], "comments": len(talk["comments"]), "updated": talk["updated"]}
+            if summary != data.get("conversation"):
+                data["conversation"] = summary
+                meta.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                changed += 1
+        if changed:
+            (checkout / "README.md").write_text(results_index(checkout), encoding="utf-8")
+            mf._gh("git", "add", "-A", cwd=checkout)
+            mf._gh("git", "commit", "-m", f"Track {changed} upstream conversation(s)", cwd=checkout)
+            pushed = mf._gh("git", "push", "-u", "origin", "main", cwd=checkout)
+            if pushed.returncode != 0:
+                mf.log(f"track: git push: {(pushed.stdout + pushed.stderr).strip()[-300:]}")
+    return changed
+
+
+EDIT = re.compile(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n?>>>>>>> REPLACE", re.S)
+FIX_SOURCE_LIMIT = 200_000  # characters of module source a fix prompt may carry
+
+
+def apply_edits(text: str, reply: str) -> str:
+    """The module source with the reply's SEARCH/REPLACE blocks applied; ValueError says what is wrong."""
+    edits = EDIT.findall(reply)
+    if not edits:
+        raise ValueError("no SEARCH/REPLACE block in the reply")
+    for old, new in edits:
+        if text.count(old) != 1:
+            raise ValueError(f"a SEARCH text must match the source exactly once; this one matches "
+                             f"{text.count(old)} times:\n{old[:300]}")
+        text = text.replace(old, new)
+    ast.parse(text)  # a SyntaxError is a ValueError
+    return text
+
+
+def _shadow(module: str, patched: str, folder: Path) -> Path:
+    """A directory that, first on PYTHONPATH, makes `module` import the patched source."""
+    origin = Path(importlib.util.find_spec(module).origin)
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    if "." in module or origin.name == "__init__.py":  # a submodule needs its whole package beside it
+        top = module.split(".")[0]
+        package = Path(importlib.util.find_spec(top).origin).parent
+        shutil.copytree(package, folder / top, ignore=shutil.ignore_patterns("__pycache__"))
+        target = folder / top / origin.relative_to(package)
+    else:
+        target = folder / origin.name
+    target.write_text(patched, encoding="utf-8")
+    return folder
+
+
+def _run_shadowed(args: list, shadow: Path | None, cwd: Path, timeout: int) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            [sys.executable, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(shadow or "")}, timeout=timeout,
+            cwd=str(cwd), creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        return proc.returncode, proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired:
+        return -1, f"TIMEOUT: exceeded {timeout}s wall clock."
+
+
+def _test_suite(module: str) -> str:
+    """The stdlib test module for `module`, or ''.
+
+    ponytail: guessed from the name; `urllib.parse` (test_urlparse) lands on test_urllib. A table when it matters.
+    """
+    for name in dict.fromkeys((module.replace(".", "_"), module.rsplit(".", 1)[-1], module.split(".")[0])):
+        try:
+            if importlib.util.find_spec(f"test.test_{name}"):
+                return f"test.test_{name}"
+        except (ImportError, ValueError):
+            continue
+    return ""
+
+
+def _failed_tests(output: str) -> set:
+    return set(re.findall(r"^(?:FAIL|ERROR): (.+)$", output, re.M))
+
+
+def check_fix(run, r: dict, module: str, patched: str) -> str:
+    """'' when the patched module passes the executable gates, else what failed: the reproducer must
+    stop confirming the bug, and the module's own test suite must fail nothing it passed before."""
+    shadow = _shadow(module, patched, run.path / f"{r['id']}_fix")
+    _rc, out = _run_shadowed([f"{r['id']}_repro.py"], shadow, run.path, mf.CODE_TIMEOUT)
+    if "REFUTATION CONFIRMED" in out or "REFUTATION REJECTED" not in out:
+        return f"the reproducer still reports the bug with your patch applied:\n{out[-2000:]}"
+    suite = _test_suite(module)
+    if suite:
+        rc, out = _run_shadowed(["-m", "unittest", suite], shadow, run.path, 900)
+        if rc != 0:
+            # a suite that already fails here (a missing resource, a Windows quirk) is not the patch's fault
+            broken = _failed_tests(out) - _failed_tests(_run_shadowed(["-m", "unittest", suite], None, run.path, 900)[1])
+            if broken or not _failed_tests(out):
+                return f"{suite} fails with your patch applied:\n{out[-3000:]}"
+    return ""
+
+
+def pull_request_advice(talk: dict, me: str) -> list:
+    """What to do about a pull request once the maintainers agreed: reopen your own closed one,
+    never count on someone else's."""
+    lines = []
+    for pr in talk.get("prs") or []:
+        if pr["state"] == "merged":
+            lines.append(f"{pr['url']} is merged: nothing to open")
+        elif pr["author"] != me:
+            lines.append(f"{pr['url']} ({pr['state']}) was opened by {pr['author'] or 'someone else'}, not you: only "
+                         "its author or a maintainer can reopen it, so open your own from the fix")
+        elif pr["state"] == "closed":
+            lines.append(f"reopen your pull request: gh pr reopen {pr['url']}")
+        else:
+            lines.append(f"your pull request {pr['url']} is open: push the fix to it")
+    return lines or ["no pull request is linked yet: open one from the fix"]
+
+
+def fix_result(forge, cid: str) -> dict:
+    """Patch one confirmed bug and, when its upstream thread is tracked, draft the reply. Writes
+    `cN_fix.diff` and `cN_reply.md` into the run directory; opens no pull request and posts nothing."""
+    run = forge.run
+    r = next((x for x in run.data.get("results") or [] if x.get("id") == cid), None)
+    if not r or r.get("status") != "bug":
+        raise ValueError(f"{cid}: no confirmed `bug` with that id in {run.path.name}")
+    with run.lock:  # a new maintainer comment changes what the fix should be: never reuse the last one
+        for key in ("fix", "reply", "go_ahead"):
+            run.data.pop(f"{cid}.{key}", None)
+    fixed = run.stage(f"{cid}.fix", lambda: forge.fix(r))
+    if fixed.get("status") != "fixed":
+        mf.log(f"no fix: {fixed.get('why', '')[:300]}", cid)
+        return fixed
+    (run.path / f"{cid}_fix.diff").write_text(fixed["diff"], encoding="utf-8")
+    mf.log(f"fix passes the reproducer and the test suite: {run.path / f'{cid}_fix.diff'}", cid)
+    if (run.data.get(f"{cid}.conversation") or {}).get("comments"):
+        (run.path / f"{cid}_reply.md").write_text(
+            run.stage(f"{cid}.reply", lambda: forge.reply(r, fixed)), encoding="utf-8")
+        mf.log(f"draft reply, not posted: {run.path / f'{cid}_reply.md'}", cid)
+        try:
+            verdict = run.stage(f"{cid}.go_ahead", lambda: forge.go_ahead(r))
+        except Exception as exc:  # an unreadable verdict is a wait, never a go
+            verdict = {"verdict": "WAIT", "reasoning": f"{type(exc).__name__}: {exc}"}
+        if verdict.get("verdict") == "APPROVED":
+            me = mf._gh("gh", "api", "user", "-q", ".login").stdout.strip()
+            for line in pull_request_advice(run.data[f"{cid}.conversation"], me):
+                mf.log(f"maintainers agreed; {line}", cid)
+        else:
+            mf.log(f"hold the pull request: {verdict.get('reasoning', '')[:300]}", cid)
+    return fixed
+
+
 def _index() -> list:
     path = OUTPUT_ROOT / "index.json"
     if not path.exists():
@@ -680,6 +973,12 @@ def research(forge_for, module: str, properties: int = 4, workers: int = 1, run_
     (run.path / "report.md").write_text(report(module, results), encoding="utf-8")
     mf.log(f"{module} done in {mf._dur(time.time() - started)}: {tally}  ({run.path / 'report.md'})")
     published = publish(run, results) if publish_results else []
+    if publish_results:
+        # ponytail: every linked issue is read after every run; space it out when there are dozens
+        try:
+            track()
+        except Exception as exc:  # the tracker being down must not cost the run its index entry
+            mf.log(f"track failed: {type(exc).__name__}: {exc}")
     summary = {"module": module, "path": run.path.name, "tally": tally, "environment": environment(module),
                "published": [p["url"] for p in published],
                "finished": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
@@ -711,7 +1010,19 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--link", nargs=2, metavar=("FOLDER", "URL"),
                     help="record the upstream issue URL you filed for a published result folder and exit")
+    ap.add_argument("--track", action="store_true",
+                    help="refresh the upstream conversation of every linked result and exit; posts nothing")
+    ap.add_argument("--fix", nargs=2, metavar=("RUN", "ID"),
+                    help="patch the bug ID (c1, c2, ...) of run directory RUN, keep the patch only if the "
+                         "reproducer and the test suite pass, draft the upstream reply, and exit")
     args = ap.parse_args(argv)
+    if args.track:
+        mf.log(f"track: {track()} conversation(s) changed")
+        return 0
+    if args.fix:
+        fix_dir = Path(args.fix[0]) if (Path(args.fix[0]) / "state.json").exists() else OUTPUT_ROOT / args.fix[0]
+        if not (fix_dir / "state.json").exists():
+            ap.error(f"{args.fix[0]}: no such run")
     if args.link:
         error = link_upstream(*args.link)
         if error:
@@ -725,7 +1036,7 @@ def main(argv=None) -> int:
             count += len(publish(run, run.data.get("results") or []))
         mf.log(f"publish: {count} result(s) published")
         return 0
-    if not (args.modules or args.auto or args.forever or args.resume):
+    if not (args.modules or args.auto or args.forever or args.resume or args.fix):
         ap.error("give module names, --auto N, --forever, --resume DIR or --publish-existing")
     for m in args.modules:
         try:
@@ -757,6 +1068,16 @@ def main(argv=None) -> int:
     from seqforge import setup_ai  # the same provider menu and model wiring
     ai = setup_ai(args, OUTPUT_ROOT / "provider_state.json")
     forge_for = lambda run: BugForge(ai, run, None, search=False)  # noqa: E731
+
+    if args.fix:
+        try:
+            track()  # the fix and the go-ahead read the thread as it is now
+        except Exception as exc:
+            mf.log(f"track failed: {type(exc).__name__}: {exc}")
+        try:
+            return 0 if fix_result(forge_for(mf.Run(fix_dir)), args.fix[1]).get("status") == "fixed" else 1
+        except ValueError as exc:
+            ap.error(str(exc))
 
     if args.resume:
         path = Path(args.resume)

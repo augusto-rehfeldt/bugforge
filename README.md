@@ -52,6 +52,22 @@ picks and mathforge's unattended defaults are unchanged.
   model calls. After a report is filed upstream, `--link FOLDER URL` records it
   in the folder's `result.json` and the index links it. The tracker search uses
   `GITHUB_TOKEN`, else the `gh` CLI's login (30 searches a minute instead of 10).
+- **After filing.** `--track` reads the upstream issue of every linked result: new
+  comments are printed and appended to `bug_output/responses.md`, the index shows
+  the issue's state and comment count, and the thread is kept in the run's
+  `state.json`. A `--publish` run does this after every module, so a `--forever
+  --publish` hunt notices replies on its own. `--fix RUN ID` (say `--fix
+  statistics-20261003-010644 c1`) asks the work model for a patch to the module's
+  own source, with the maintainers' comments as constraints, and keeps it only if
+  the reproducer stops confirming the bug and the module's stdlib test suite fails
+  nothing it passed before. It writes `cN_fix.diff` and, for a tracked thread, a
+  draft `cN_reply.md` into the run directory. It then reads the thread for a
+  go-ahead: only a maintainer agreeing with the approach, with none of their
+  questions left open, counts. On a go-ahead it says what to do about the linked
+  pull requests (`gh pr reopen` for your own closed one; another person's cannot
+  be reopened by you); otherwise it says what is still open. Neither command posts
+  a comment, or opens or reopens a pull request. A fix needs a pure-Python module; the draft reply is told
+  to say which measurements were not run.
 - **Nothing is filed upstream automatically.** A `bug` gets a drafted issue in `report.md`: environment,
   documented behavior, expected and actual results, reproducer and its output.
   Maintainers already get too many AI reports, so a person runs the reproducer

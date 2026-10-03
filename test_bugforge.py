@@ -361,6 +361,77 @@ class BugforgePublishTest(unittest.TestCase):
         self.assertIn(f"[cpython#158631]({url})", (self.checkout / "README.md").read_text(encoding="utf-8"))
         self.assertIn("no such published result", bf.link_upstream("heapq-nope", url))
 
+    def test_track_records_the_upstream_thread_and_shows_its_state(self):
+        run = bf.mf.Run(self.tmp / "statistics-20261003-010644")
+        run.data["module"] = "statistics"
+        run.save()
+        folder = self.checkout / "statistics-c1"
+        folder.mkdir()
+        (folder / "result.json").write_text(json.dumps({
+            "folder": "statistics-c1", "run": run.path.name, "id": "c1", "title": "kde overflows",
+            "upstream": "[cpython#158631](https://github.com/python/cpython/issues/158631)"}), encoding="utf-8")
+        (self.checkout / "unfiled").mkdir()
+        (self.checkout / "unfiled" / "result.json").write_text(json.dumps({"folder": "unfiled", "upstream": None}),
+                                                               encoding="utf-8")
+        comments = [{"user": {"login": "picnixz"}, "author_association": "MEMBER", "created_at": "d",
+                     "body": "how are performances affected?"}]
+        def replies(url):
+            if "/pulls/" in url:
+                return {"state": "closed", "user": {"login": "someone"}, "html_url": "https://github.com/python/cpython/pull/158632"}
+            return comments if url.endswith("per_page=100") else {
+                "state": "open", "comments": 1, "user": {"login": "me"}, "body": "bug\n### Linked PRs\n* gh-158632\n"}
+        with mock.patch.object(bf, "github", side_effect=replies) as get, mock.patch.object(bf.mf, "log") as log:
+            self.assertEqual(bf.track(), 1)
+            self.assertEqual(bf.track(), 0)  # nothing new: no commit
+        self.assertIn("api.github.com/repos/python/cpython/issues/158631", get.call_args_list[0][0][0])
+        self.assertIn("new comment by picnixz (MEMBER)", log.call_args_list[0][0][0])
+        self.assertIn("(open, 1 comment(s))", (self.checkout / "README.md").read_text(encoding="utf-8"))
+        responses = (self.tmp / "responses.md").read_text(encoding="utf-8")
+        self.assertEqual(responses.count("how are performances affected?"), 1)  # logged once, not per call
+        talk = bf.mf.Run(run.path).data["c1.conversation"]
+        self.assertEqual(talk["comments"][0]["body"], "how are performances affected?")
+        self.assertEqual((talk["reporter"], talk["prs"][0]["state"]), ("me", "closed"))
+        self.assertIn("not you", bf.pull_request_advice(talk, "me")[0])  # another person's PR is not ours to reopen
+        self.assertIn("gh pr reopen", bf.pull_request_advice(talk, "someone")[0])
+        self.assertIn("open one from the fix", bf.pull_request_advice({}, "me")[0])
+        self.assertEqual(sum(1 for c in self.calls if c[:2] == ("git", "push")), 1)
+
+    def test_a_fix_is_kept_only_when_the_reproducer_passes_and_the_thread_steers_it(self):
+        (self.tmp / "bfbuggy.py").write_text("def double(x):\n    return x + x + 1\n", encoding="utf-8")
+        sys.path.insert(0, str(self.tmp))
+        self.addCleanup(sys.path.remove, str(self.tmp))
+        run = bf.mf.Run(self.tmp / "bfbuggy-20261003-010644")
+        repro = ("import bfbuggy\n"
+                 "print('REFUTATION REJECTED: ok' if bfbuggy.double(2) == 4 else 'REFUTATION CONFIRMED: 5')\n")
+        (run.path / "c1_repro.py").write_text(repro, encoding="utf-8")
+        bug = {"id": "c1", "target": "bfbuggy.double", "statement": "double(x) == 2*x", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED: 5", code=repro), "judge": {"verdict": "BUG"}}
+        run.data.update(module="bfbuggy", results=[bug])
+        run.data["c1.conversation"] = {"comments": [{"author": "m", "role": "MEMBER", "date": "d",
+                                                     "body": "keep the fast path"}]}
+        block = "<<<<<<< SEARCH\n    return x + x + 1\n=======\n    return {}\n>>>>>>> REPLACE"
+        ai = StubAI(["I would change the return.", block.format("x * 3"), block.format("x + x"), "Done as asked.",
+                     '{"verdict": "WAIT", "reasoning": "the benchmark is unanswered"}'])
+        with mock.patch.object(bf.mf, "log") as log:
+            fixed = bf.fix_result(bf.BugForge(ai, run, None, search=False), "c1")
+        self.assertIn("hold the pull request: the benchmark is unanswered", log.call_args_list[-1][0][0])
+        self.assertIn("m (MEMBER)", ai.prompts[4])
+        run.data["c1.conversation"]["prs"] = [{"url": "u", "author": "", "state": "closed"}]
+        ai.replies += [block.format("x + x"), "Done as asked.", '{"verdict": "APPROVED", "reasoning": "asked for the PR"}']
+        with mock.patch.object(bf.mf, "log") as log:
+            bf.fix_result(bf.BugForge(ai, run, None, search=False), "c1")
+        self.assertIn("maintainers agreed; reopen your pull request: gh pr reopen u", log.call_args_list[-1][0][0])
+        self.assertEqual((fixed["status"], fixed["repairs"]), ("fixed", 2))
+        self.assertIn("+    return x + x\n", (run.path / "c1_fix.diff").read_text(encoding="utf-8"))
+        self.assertIn("keep the fast path", ai.prompts[0])
+        self.assertIn("no SEARCH/REPLACE block", ai.prompts[1])
+        self.assertIn("still reports the bug", ai.prompts[2])
+        self.assertEqual((run.path / "c1_reply.md").read_text(encoding="utf-8"), "Done as asked.")
+        with self.assertRaises(ValueError):
+            bf.fix_result(bf.BugForge(StubAI([]), run, None, search=False), "c9")
+        with self.assertRaises(ValueError):
+            bf.apply_edits("a = 1\na = 1\n", "<<<<<<< SEARCH\na = 1\n=======\na = 2\n>>>>>>> REPLACE")
+
     def test_gh_login_is_the_fallback_search_token(self):
         self.calls.clear()
         _real_gh_token.cache_clear()
