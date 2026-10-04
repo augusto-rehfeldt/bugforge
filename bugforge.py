@@ -12,9 +12,11 @@ decides BUG, DOC_BUG, DUPLICATE or NOT_A_BUG.
     python bugforge.py --auto 5 --workers 3    # the five least-hunted stdlib modules
     python bugforge.py --forever --workers 3
 
-Nothing is filed anywhere. A confirmed bug gets a drafted issue in report.md for a
+Nothing is filed unless asked. A confirmed bug gets a drafted issue in report.md for a
 person to check and file: maintainers are already flooded with AI reports, and
-every one sent should be one a person stands behind.
+every one sent should be one a person stands behind. `--file` files a published
+result upstream unread, says so in the issue, and files no other in that project
+while it is open.
 
 Generated scripts run unsandboxed in the run directory (as in mathforge), so
 modules that touch files, processes, the network or deserialization are refused.
@@ -51,13 +53,26 @@ sys.path.insert(0, str(MATHFORGE))
 import mathforge as mf  # noqa: E402
 
 OUTPUT_ROOT = Path(os.getenv("BUGFORGE_OUTPUT") or HERE / "bug_output")
+
+
+def _installed(module: str) -> bool:
+    try:
+        return importlib.util.find_spec(module) is not None
+    except ImportError:  # the parent package is missing
+        return False
+
+
 # pure-computation stdlib modules with precise documentation: a promise to test, no side effects
 AUTO_TARGETS = tuple(m for m in (
     "fractions", "decimal", "statistics", "difflib", "textwrap", "ipaddress", "json", "colorsys", "calendar",
     "datetime", "urllib.parse", "shlex", "base64", "html", "html.parser", "string", "email.utils",
     "email.headerregistry", "configparser", "csv", "heapq", "bisect", "itertools", "math", "cmath", "random",
     "unicodedata", "zlib", "graphlib", "tomllib", "fnmatch", "reprlib", "pprint", "plistlib", "quopri", "wave",
-    "struct", "operator") if importlib.util.find_spec(m))  # a module removed from this Python is no target
+    "struct", "operator",
+    # popular PyPI packages of the same kind: parsing and arithmetic, no files, processes or network
+    "packaging.version", "packaging.specifiers", "packaging.utils", "idna", "dateutil.parser",
+    "dateutil.relativedelta", "dateutil.rrule", "markupsafe", "more_itertools", "sortedcontainers", "isodate",
+    "wcwidth", "tabulate", "yarl") if _installed(m))  # a module not in this Python is no target
 # fuzzing these could delete files, start processes, talk to the network or run code
 DENIED = ("os", "shutil", "subprocess", "socket", "tempfile", "signal", "multiprocessing", "ctypes",
           "urllib.request", "http", "ftplib", "smtplib", "poplib", "imaplib", "asyncio", "webbrowser", "ssl",
@@ -233,15 +248,80 @@ def main_diff(module: str, limit: int = 40000) -> str:
     return (diff or "(identical to main)") + note
 
 
+def _dist(module: str) -> str:
+    """The PyPI distribution that ships `module`: `dateutil` comes from python-dateutil."""
+    top = module.split(".")[0]
+    return (importlib.metadata.packages_distributions().get(top) or [top])[0]
+
+
 def environment(module: str) -> str:
     top = module.split(".")[0]
     if top in sys.stdlib_module_names:
         return f"Python {platform.python_version()} ({platform.platform()}), standard library `{module}`"
     try:
-        version = importlib.metadata.version(top)
+        version = importlib.metadata.version(_dist(module))
     except importlib.metadata.PackageNotFoundError:
         version = "unknown version"
     return f"Python {platform.python_version()} ({platform.platform()}), `{top}` {version}"
+
+
+UNLISTED_TRACKERS = {"sortedcontainers": "grantjenks/python-sortedcontainers"}  # its metadata links only its website
+TRACKER_LABELS = ("source", "source code", "code", "repository", "homepage", "github", "tracker", "bug tracker",
+                  "issue tracker", "issues")
+
+
+@functools.lru_cache(maxsize=None)
+def tracker(module: str) -> str:
+    """`owner/name` of the GitHub repository whose issues take reports about `module`, or '' when
+    its package names none: python/cpython for the standard library, else the package's own links."""
+    top = module.split(".")[0]
+    if top in sys.stdlib_module_names:
+        return "python/cpython"
+    try:
+        meta = importlib.metadata.metadata(_dist(module))
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return ""
+    urls = (meta.get_all("Project-URL") or []) + [f"homepage, {meta.get('Home-page') or ''}"]
+    # the source link first: aio-libs also links its code of conduct, which lives in another repository
+    for url in sorted(urls, key=lambda u: u.split(",")[0].strip().lower() not in TRACKER_LABELS):
+        found = re.search(r"github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?(?:[/#?]|$)", url)
+        if found and found.group(1) != "sponsors":
+            return f"{found.group(1)}/{found.group(2)}"
+    return UNLISTED_TRACKERS.get(top, "")
+
+
+TOP_PYPI = "https://hugovk.github.io/top-pypi-packages/top-pypi-packages.min.json"
+POPULAR_RANK = 1000
+
+
+@functools.lru_cache(maxsize=1)
+def _top_pypi() -> tuple:
+    """The most downloaded PyPI projects by normalized name; the list is kept a month in bug_output."""
+    cache = OUTPUT_ROOT / "top-pypi.json"
+    if not cache.exists() or time.time() - cache.stat().st_mtime > 30 * 86400:
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        cache.write_text(mf._http_get(TOP_PYPI), encoding="utf-8")
+    rows = json.loads(cache.read_text(encoding="utf-8"))["rows"][:POPULAR_RANK]
+    return tuple(re.sub(r"[-_.]+", "-", row["project"]).lower() for row in rows)
+
+
+def unfileable(module: str) -> str:
+    """Why a result in `module` must not go upstream, or ''. A package has to be popular, since a
+    small project's maintainer has no time for a tool's reports, and installed at its latest
+    release, since an older one's bug may be fixed already."""
+    if module.split(".")[0] in sys.stdlib_module_names:
+        return ""
+    dist = _dist(module)
+    try:
+        if re.sub(r"[-_.]+", "-", dist).lower() not in _top_pypi():
+            return f"{dist} is not among the {POPULAR_RANK} most downloaded PyPI projects"
+        latest = json.loads(mf._http_get(f"https://pypi.org/pypi/{dist}/json"))["info"]["version"]
+        installed = importlib.metadata.version(dist)
+        if latest != installed:
+            return f"{dist} {installed} is installed and {latest} is out: upgrade it and hunt again"
+    except Exception as exc:  # unchecked is not filed
+        return f"{dist} could not be checked: {type(exc).__name__}: {exc}"
+    return ""
 
 
 class BugForge(mf.Forge):
@@ -328,7 +408,7 @@ class BugForge(mf.Forge):
         """Existing issues that may already report it: the project's tracker for the stdlib."""
         # the module, not the model-written target: "Fraction.limit_denominator" is no module name
         module = self.run.data.get("module") or c.get("target", "")
-        repo = " repo:python/cpython" if module.split(".")[0] in sys.stdlib_module_names else ""
+        repo = f" repo:{tracker(module)}" if tracker(module) else ""
         try:
             queries = self.ask_json(
                 f"Write 3 short GitHub issue-search queries (3-6 words each) that would find an existing "
@@ -489,8 +569,10 @@ class BugForge(mf.Forge):
             "none of their questions (a benchmark, precision, a design choice, waiting for another "
             "maintainer) is still unanswered or unacknowledged.\n"
             "REJECTED only if such a person dismissed the fix as a whole (not a bug, will not be "
-            "changed, closed as not planned) and asked nothing and proposed no alternative: there is "
-            "nothing left to answer.\n"
+            "changed, not applicable, closed as not planned) and asked nothing and proposed no "
+            "alternative: there is nothing left to answer. Also REJECTED, whatever else the comment "
+            "says, if such a person told the reporter to stop: to stop replying, to stop sending "
+            "these, or not to answer with generated text.\n"
             "CHANGES if the latest comments ask the reporter a question, request a measurement or a "
             "test, or propose a different design, even inside a refusal of the current patch: "
             "something the reporter can answer with a revised patch or a reply.\n"
@@ -513,7 +595,10 @@ class BugForge(mf.Forge):
             "Answer each open question in the thread, shortly and plainly. State only what the patch "
             "and the runs above show. Where a maintainer asks for a measurement or a build that was "
             "not run (a benchmark, a PGO build, another platform), say it has not been run yet "
-            "instead of guessing a number. No flattery, no headings.")
+            "instead of guessing a number. Where a comment can be read two ways, ask which is meant "
+            "instead of picking one. Write the way a courteous contributor writes in a tracker: first "
+            "person, plain words, a few short paragraphs, thanks at most once. No flattery, no "
+            "headings, no bullet-point summary of what you did.")
 
 
 def hunt(forge, c: dict) -> dict:
@@ -626,12 +711,12 @@ def results_index(checkout: Path) -> str:
              "one language model proposes a documented property, another searches for a failing input, a "
              "third writes a minimal standalone reproducer, which is run, and a judge reads the reproducer, "
              "the documentation and the project's issue tracker. Every folder holds the reproducer and its "
-             "output on the Python version named. No person reviewed these before publication; upstream "
-             "reports are filed by hand, and a result is linked to its issue once filed.", "",
+             "output on the Python version named. No person reviewed these before publication. A result "
+             "is linked to its upstream issue once one is filed, at most one open issue per project.", "",
              f"{len(rows)} result(s).", "",
              "| Date | Target | Verdict | Title | Python | Upstream |", "| --- | --- | --- | --- | --- | --- |"]
     for m in rows:
-        title = m.get("title", "").replace("|", "\\|")
+        title = re.sub(r"([\\\[\]|])", r"\\\1", m.get("title", ""))  # a lone `[` ends the link text early
         talk = m.get("conversation") or {}
         upstream = (m.get("upstream") or "not filed") + (
             f" ({talk.get('state', '')}, {talk.get('comments', 0)} comment(s))" if talk else "")
@@ -791,18 +876,19 @@ def discover(checkout: Path, me: str) -> int:
     report filed by hand is followed without --link; returns how many were linked.
 
     An issue counts when it is yours, names bugforge, and either names the result's folder or
-    names the target of exactly one unlinked result. Standard library results only: another
-    project's tracker is not known here.
+    names the target of exactly one unlinked result. Each project is searched in the tracker
+    `tracker()` names for it.
     """
     metas = {m: json.loads(m.read_text(encoding="utf-8")) for m in sorted(checkout.glob("*/result.json"))}
     taken = {UPSTREAM_ISSUE.search(d["upstream"]).group(0) for d in metas.values()
              if UPSTREAM_ISSUE.search(d.get("upstream") or "")}
-    unlinked = {m: d for m, d in metas.items() if not d.get("upstream")
-                and d.get("target", "").split(".")[0] in sys.stdlib_module_names}
+    unlinked = {m: d for m, d in metas.items() if not d.get("upstream") and tracker(d.get("target", ""))}
     if not me or not unlinked:
         return 0
-    found = github(GITHUB_SEARCH + urllib.parse.urlencode(
-        {"q": f"repo:python/cpython author:{me} bugforge in:body", "per_page": 50})).get("items") or []
+    found = []
+    for repo in sorted({tracker(d["target"]) for d in unlinked.values()}):
+        found += github(GITHUB_SEARCH + urllib.parse.urlencode(
+            {"q": f"repo:{repo} author:{me} bugforge in:body", "per_page": 50})).get("items") or []
     linked = 0
     for item in sorted(found, key=lambda i: "pull_request" in i):  # the issue before its pull request
         link = UPSTREAM_ISSUE.search(item.get("html_url") or "")
@@ -810,7 +896,8 @@ def discover(checkout: Path, me: str) -> int:
             continue
         text = f"{item.get('title', '')}\n{item.get('body') or ''}"
         hits = [m for m, d in unlinked.items() if d["folder"] in text] or [
-            m for m, d in unlinked.items() if d.get("target") and re.search(rf"(?<![\w.]){re.escape(d['target'])}(?![\w.])", text)]
+            m for m, d in unlinked.items() if d.get("target") and re.search(rf"(?<![\w.]){re.escape(d['target'])}(?![\w.])", text)
+            and tracker(d["target"]).lower() == f"{link.group(1)}/{link.group(2)}".lower()]
         if len(hits) != 1:
             if hits:
                 mf.log(f"{item['html_url']} fits {len(hits)} results; --link the right one")
@@ -840,6 +927,8 @@ def track() -> int:
             data = json.loads(meta.read_text(encoding="utf-8"))
             if not UPSTREAM_ISSUE.search(data.get("upstream") or ""):
                 continue
+            if (data.get("conversation") or {}).get("state") == "closed":
+                continue  # solved or turned down: a closed thread is not read again
             try:
                 talk = conversation(data["upstream"], me)
             except Exception as exc:  # one unreachable issue must not hide the others
@@ -871,6 +960,114 @@ def track() -> int:
             if pushed.returncode != 0:
                 mf.log(f"track: git push: {(pushed.stdout + pushed.stderr).strip()[-300:]}")
     return changed
+
+
+SEVERITIES = ("high", "medium", "low")
+
+
+def issue_body(r: dict, env: str, folder_url: str, cpython: bool = True) -> str:
+    """The upstream issue for one confirmed result; CPython's tracker gets its bug-report layout.
+    It says what it is: written by a tool and not read by a person, with the reproducer's own output."""
+    j = r.get("judge") or {}
+    body = [f"**Documented behaviour:** {r.get('spec_basis', '')}", "",
+            f"**Expected:** {j.get('expected', '')}", "", f"**Actual:** {j.get('actual', '')}", "",
+            "```python", r["repro"]["code"].strip(), "```", "", f"Output on {env}:", "",
+            "```", r["repro"]["output"].strip()[-1500:], "```", "",
+            f"This report was found and written by an automated property-testing tool I run ([bugforge]({BUGFORGE_URL})). "
+            "The reproducer above was executed and its output is pasted unedited; no person reviewed the report "
+            f"before it was filed. The search script is in {folder_url}", ""]
+    if cpython:
+        body = ["# Bug report", "", "### Bug description:", "", *body,
+                "### CPython versions tested on:", "", (re.match(r"Python (\d+\.\d+)", env) or [None, ""])[1], "",
+                "### Operating systems tested on:", "", platform.system(), ""]
+    return "\n".join(body)
+
+
+def _busy(checkout: Path, metas: list) -> set:
+    """Projects that already have an open report of ours, each `owner/name` in lower case: a linked
+    result whose issue is not closed (a thread never read counts as open), or an open tracking
+    issue named in the results repository's `tracking.json` ({"owner/name": issue URL})."""
+    busy = set()
+    for d in metas:
+        link = UPSTREAM_ISSUE.search(d.get("upstream") or "")
+        if link and (d.get("conversation") or {}).get("state") != "closed":
+            busy.add(f"{link.group(1)}/{link.group(2)}".lower())
+    path = checkout / "tracking.json"
+    for repo, url in (json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}).items():
+        link = UPSTREAM_ISSUE.search(url)
+        try:
+            state = github(f"https://api.github.com/repos/{link.group(1)}/{link.group(2)}/issues/{link.group(3)}").get("state")
+        except Exception:  # unread counts as open
+            state = ""
+        if state != "closed":
+            busy.add(repo.lower())
+    return busy
+
+
+def file_upstream(post: bool = True) -> list:
+    """File published results that have no upstream report as issues in their project's tracker,
+    the most severe first; returns the issue URLs. One at a time per project: nothing is filed
+    where a report of ours is still open, so the next one waits until that is solved or turned
+    down. A flood of reports gets them all closed unread, as python/cpython did with ninety.
+
+    Each is checked again first: the package must be popular and at its latest release, the
+    reproducer must still confirm the bug when run now, and one issue per target is enough, so a
+    second finding in a function already reported is held back. `post=False` writes the
+    `cN_issue.md` drafts and files nothing.
+    """
+    track()  # a report filed by hand is linked first, never filed twice
+    with _REPO_LOCK:
+        repo, checkout = _checkout()
+        metas = [json.loads(m.read_text(encoding="utf-8")) for m in sorted(checkout.glob("*/result.json"))]
+        busy = _busy(checkout, metas)
+    reported = {d.get("target") for d in metas if d.get("upstream")}
+    rows = []
+    for data in metas:
+        if data.get("upstream") or not (OUTPUT_ROOT / str(data.get("run")) / "state.json").exists():
+            continue
+        run = mf.Run(OUTPUT_ROOT / data["run"])
+        r = next((x for x in run.data.get("results") or []
+                  if x.get("id") == data.get("id") and x.get("status") in PUBLISH_STATUSES), None)
+        if r:
+            severity = (r.get("judge") or {}).get("severity")
+            rows.append((SEVERITIES.index(severity) if severity in SEVERITIES else len(SEVERITIES), data, run, r))
+    filed = []
+    for _rank, data, run, r in sorted(rows, key=lambda row: row[0]):
+        module, where = run.data.get("module") or data.get("target", ""), f"{run.path.name}/{r['id']}"
+        project = tracker(module)
+        if not project or project.lower() in busy:
+            continue  # no tracker known, or it is that project's turn to answer
+        if data.get("target") in reported:
+            mf.log(f"not filed: {data.get('target')} already has a report", where)
+            continue
+        why = unfileable(module)
+        if why:
+            mf.log(f"not filed: {why}", where)
+            continue
+        _rc, out = _run_shadowed([f"{r['id']}_repro.py"], None, run.path, mf.CODE_TIMEOUT)
+        if "REFUTATION CONFIRMED" not in out:
+            mf.log("not filed: the reproducer no longer confirms the bug", where)
+            continue
+        reported.add(data.get("target"))
+        busy.add(project.lower())
+        draft = run.path / f"{r['id']}_issue.md"
+        draft.write_text(issue_body(r, environment(module), f"https://github.com/{repo}/tree/main/{data['folder']}",
+                                    project == "python/cpython"), encoding="utf-8")
+        if not post:
+            mf.log(f"would file on {project}: {data['title']}  ({draft})", r["id"])
+            filed.append(str(draft))
+            continue
+        sent = mf._gh("gh", "issue", "create", "-R", project, "--title", data["title"], "--body-file", str(draft))
+        url = UPSTREAM_ISSUE.search(sent.stdout)
+        if sent.returncode != 0 or not url:
+            raise RuntimeError(f"gh issue create: {(sent.stdout + sent.stderr).strip()[-300:]}")
+        url = "https://" + url.group(0)
+        mf.log(f"filed: {url}", r["id"])
+        filed.append(url)
+        error = link_upstream(data["folder"], url)
+        if error:  # the body names the folder, so the next track() finds and links it
+            mf.log(f"filed but not linked: {error}", r["id"])
+    return filed
 
 
 EDIT = re.compile(r"<<<<<<< SEARCH\n(.*?)\n=======\n(.*?)\n?>>>>>>> REPLACE", re.S)
@@ -1018,6 +1215,12 @@ def take_turn(forge, cid: str, me: str, post: bool = False) -> str:
     r = next((x for x in run.data.get("results") or [] if x.get("id") == cid), None)
     if not r:
         return "waiting"
+    if talk.get("state") == "closed":  # solved or turned down: a closed issue is never answered
+        mf.log(f"upstream closed {talk.get('url', '')}; no reply", cid)
+        with run.lock:
+            run.data[f"{cid}.answered"], run.data[f"{cid}.thread"] = comments[-1]["date"], "rejected"
+        run.save()
+        return "rejected"
     verdict = forge.go_ahead(r)  # a failure here raises: the comment stays unanswered and is retried
     status = {"APPROVED": "approved", "REJECTED": "rejected", "CHANGES": "changes"}.get(verdict.get("verdict"), "waiting")
     why = verdict.get("reasoning", "")[:300]
@@ -1151,6 +1354,11 @@ def main(argv=None) -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--link", nargs=2, metavar=("FOLDER", "URL"),
                     help="record the upstream issue URL you filed for a published result folder and exit")
+    ap.add_argument("--file", action="store_true",
+                    help="file published, unfiled results as issues in their project's tracker, as you through gh: "
+                         "python/cpython or a popular package's GitHub repository, one open report per project "
+                         "at a time. Alone it files and exits, with a hunt it tries after each module. Nobody "
+                         "read these")
     ap.add_argument("--track", action="store_true",
                     help="refresh the upstream conversation of every linked result and exit; posts nothing")
     ap.add_argument("--fix", nargs=2, metavar=("RUN", "ID"),
@@ -1163,7 +1371,7 @@ def main(argv=None) -> int:
                          f"a reply posted as you through gh, at most {MAX_REPLIES} per issue, until a maintainer "
                          "approves or turns the idea down")
     ap.add_argument("--no-post", action="store_true",
-                    help="draft those replies into the run directory, post nothing upstream")
+                    help="draft those replies, and the issues of --file, into the run directory; post nothing upstream")
     args = ap.parse_args(argv)
     if args.track:
         mf.log(f"track: {track()} conversation(s) changed")
@@ -1185,7 +1393,11 @@ def main(argv=None) -> int:
             count += len(publish(run, run.data.get("results") or []))
         mf.log(f"publish: {count} result(s) published")
         return 0
-    if not (args.modules or args.auto or args.forever or args.resume or args.fix or args.converse):
+    hunting = args.modules or args.auto or args.forever or args.resume
+    if args.file and not hunting:
+        mf.log(f"file: {len(file_upstream(not args.no_post))} issue(s) {'drafted' if args.no_post else 'filed'}")
+        return 0
+    if not (hunting or args.fix or args.converse):
         ap.error("give module names, --auto N, --forever, --resume DIR or --publish-existing")
     for m in args.modules:
         try:
@@ -1230,6 +1442,11 @@ def main(argv=None) -> int:
 
     def talk_upstream() -> None:
         # ponytail: every linked issue is read after every module; space it out when there are dozens
+        try:
+            if args.file:
+                file_upstream(not args.no_post)
+        except Exception as exc:  # the tracker being down must not stop the hunt
+            mf.log(f"file failed: {type(exc).__name__}: {exc}")
         try:
             for name, status in converse(forge_for, not args.no_post).items():
                 mf.log(f"upstream {name}: {status}")

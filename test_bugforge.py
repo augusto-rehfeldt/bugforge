@@ -317,7 +317,7 @@ class BugforgePublishTest(unittest.TestCase):
         (run.path / "c1_repro.py").write_text("import statistics", encoding="utf-8")
         bug = {"id": "c1", "title": "kde overflows", "target": "statistics.kde", "statement": "p", "status": "bug",
                "repro": _ran("REFUTATION CONFIRMED", code="import statistics"),
-               "judge": {"verdict": "BUG", "issue_title": "statistics.kde logistic kernel overflows"}}
+               "judge": {"verdict": "BUG", "issue_title": "statistics.kde logistic kernel overflows on '[' | x"}}
         held = {"id": "c2", "target": "statistics.mean", "statement": "q", "status": "holds",
                 "falsification": _ran("NO COUNTEREXAMPLE")}
         with mock.patch.object(bf.shutil, "which", return_value="x"):
@@ -330,7 +330,7 @@ class BugforgePublishTest(unittest.TestCase):
         self.assertIn("import statistics", (folder / "README.md").read_text(encoding="utf-8"))
         self.assertTrue((folder / "c1_repro.py").exists())
         index = (self.checkout / "README.md").read_text(encoding="utf-8")
-        self.assertIn("statistics.kde logistic kernel overflows", index)
+        self.assertIn("[statistics.kde logistic kernel overflows on '\\[' \\| x](", index)
         self.assertIn("not filed", index)
         readme = (folder / "README.md").read_text(encoding="utf-8")
         self.assertIn("not reviewed by a person", readme.splitlines()[0])
@@ -362,6 +362,72 @@ class BugforgePublishTest(unittest.TestCase):
         self.assertEqual(bf.link_upstream("heapq-20261003-022813-c2", url), "")
         self.assertIn(f"[cpython#158631]({url})", (self.checkout / "README.md").read_text(encoding="utf-8"))
         self.assertIn("no such published result", bf.link_upstream("heapq-nope", url))
+
+    def test_filing_takes_the_most_severe_unfiled_result_and_waits_while_one_is_open(self):
+        run = bf.mf.Run(self.tmp / "heapq-20261003-022813")
+        run.data["module"] = "heapq"
+        low = {"id": "c1", "target": "heapq.merge", "statement": "p", "status": "bug",
+               "repro": _ran("REFUTATION CONFIRMED", code="import heapq"), "judge": {"verdict": "BUG", "severity": "low"}}
+        run.data["results"] = [low, {**low, "id": "c2", "judge": {"verdict": "BUG", "severity": "medium"}},
+                               {**low, "id": "c3", "judge": {"verdict": "BUG", "severity": "high"}}]
+        run.save()
+        for cid in ("c1", "c2", "c3"):
+            (run.path / f"{cid}_repro.py").write_text("print('REFUTATION CONFIRMED')", encoding="utf-8")
+        for cid, upstream in (("c1", None), ("c2", None), ("c3", "[cpython#1](https://github.com/python/cpython/issues/1)")):
+            talk = {"conversation": {"state": "closed"}} if upstream else {}
+            (self.checkout / f"heapq-{cid}").mkdir()
+            (self.checkout / f"heapq-{cid}" / "result.json").write_text(json.dumps({
+                "folder": f"heapq-{cid}", "run": run.path.name, "id": cid, "title": f"merge {cid}",
+                "target": f"heapq.{cid}", "upstream": upstream, **talk}), encoding="utf-8")
+
+        def gh(*args, cwd=None, timeout=180):
+            self.calls.append(args)
+            return bf.subprocess.CompletedProcess(args, 0, "https://github.com/python/cpython/issues/7\n", "")
+        with mock.patch.object(bf.mf, "_gh", gh), mock.patch.object(bf, "track"), mock.patch.object(bf.mf, "log"):
+            self.assertEqual(len(bf.file_upstream(post=False)), 1)  # --no-post: a draft only
+            self.assertEqual(self.calls, [])
+            self.assertEqual(bf.file_upstream(), ["https://github.com/python/cpython/issues/7"])
+            self.assertEqual(bf.file_upstream(), [])  # c2's issue is open: c1 waits
+            meta = self.checkout / "heapq-c2" / "result.json"
+            meta.write_text(json.dumps({**json.loads(meta.read_text(encoding="utf-8")),
+                                        "conversation": {"state": "closed"}}), encoding="utf-8")
+            (run.path / "c1_repro.py").write_text("print('REFUTATION REJECTED')", encoding="utf-8")
+            self.assertEqual(bf.file_upstream(), [])  # c1 no longer reproduces
+        created = [c for c in self.calls if c[:3] == ("gh", "issue", "create")]
+        self.assertEqual([c[c.index("--title") + 1] for c in created], ["merge c2"])  # medium before low; c3 is filed
+        body = (run.path / "c2_issue.md").read_text(encoding="utf-8")
+        self.assertIn("import heapq", body)
+        self.assertIn("no person reviewed the report", body)
+        self.assertIn("u/bugforge-results/tree/main/heapq-c2", body)
+        self.assertIn("cpython#7", json.loads((self.checkout / "heapq-c2" / "result.json").read_text(encoding="utf-8"))["upstream"])
+
+    def test_a_package_is_filed_in_its_own_tracker_when_popular_and_one_report_per_project(self):
+        meta = {"Project-URL": ["Code of Conduct, https://github.com/org/.github/blob/main/COC.md",
+                                "Source, https://github.com/org/pkg.git"]}
+        fake = mock.Mock(get_all=lambda key: meta.get(key), get=lambda key: None)
+        bf.tracker.cache_clear()
+        self.addCleanup(bf.tracker.cache_clear)
+        with mock.patch.object(bf.importlib.metadata, "metadata", return_value=fake), \
+                mock.patch.object(bf, "_dist", return_value="Some_Pkg"):
+            self.assertEqual(bf.tracker("bfpkg.sub"), "org/pkg")  # the source link, not the first GitHub link
+            self.assertEqual(bf.tracker("heapq"), "python/cpython")
+            with mock.patch.object(bf, "_top_pypi", return_value=("other",)):
+                self.assertIn("not among the 1000", bf.unfileable("bfpkg.sub"))
+            with mock.patch.object(bf, "_top_pypi", return_value=("some-pkg",)), \
+                    mock.patch.object(bf.mf, "_http_get", return_value='{"info": {"version": "2.0"}}'), \
+                    mock.patch.object(bf.importlib.metadata, "version", return_value="1.0"):
+                self.assertIn("2.0 is out", bf.unfileable("bfpkg.sub"))  # an old release's bug may be fixed
+            self.assertEqual(bf.unfileable("heapq"), "")
+        linked = {"upstream": "[pkg#3](https://github.com/Org/Pkg/issues/3)", "conversation": {"state": "open"}}
+        done = {"upstream": "[cpython#1](https://github.com/python/cpython/issues/1)", "conversation": {"state": "closed"}}
+        (self.checkout / "tracking.json").write_text('{"python/cpython": "https://github.com/python/cpython/issues/9"}',
+                                                     encoding="utf-8")
+        with mock.patch.object(bf, "github", return_value={"state": "open"}):
+            self.assertEqual(bf._busy(self.checkout, [linked, done]), {"org/pkg", "python/cpython"})
+        with mock.patch.object(bf, "github", return_value={"state": "closed"}):
+            self.assertEqual(bf._busy(self.checkout, [linked, done]), {"org/pkg"})
+        self.assertNotIn("CPython versions", bf.issue_body(
+            {"repro": _ran("REFUTATION CONFIRMED", code="x")}, "Python 3.14.6 (w), `pkg` 1.0", "u", cpython=False))
 
     def test_track_records_the_upstream_thread_and_shows_its_state(self):
         run = bf.mf.Run(self.tmp / "statistics-20261003-010644")
@@ -454,6 +520,11 @@ class BugforgePublishTest(unittest.TestCase):
         talk["comments"].append(said("m", "d3", "we will not change this"))
         ai.replies.append('{"verdict": "REJECTED", "reasoning": "dismissed as a whole"}')
         self.assertEqual(turn(), "rejected")
+        talk["state"] = "closed"
+        talk["comments"].append(said("m", "d3b", "closing these; could you compile a gist instead?"))
+        self.assertEqual(turn(), "rejected")  # a closed issue is never answered, whatever it asks
+        self.assertEqual(len(ai.prompts), 4)  # and no model is asked
+        talk["state"] = "open"
         talk["comments"].append(said("m", "d4", "on second thought, send the PR"))
         ai.replies.append('{"verdict": "APPROVED", "reasoning": "asked for the PR"}')
         with mock.patch.object(bf.mf, "log") as log:
@@ -478,7 +549,7 @@ class BugforgePublishTest(unittest.TestCase):
         result("heapq-x-c1", "heapq.merge")
         result("csv-y-c2", "csv.DictReader")
         result("csv-z-c1", "csv.DictReader")
-        result("requests-c1", "requests.get")  # not the standard library: its tracker is unknown
+        result("requests-c1", "bfnopkg.get")  # no installed package: its tracker is unknown
         issue = lambda n, body, pr=False: {"html_url": f"https://github.com/python/cpython/{'pull' if pr else 'issues'}/{n}",  # noqa: E731
                                            "title": "x", "body": body, **({"pull_request": {}} if pr else {})}
         found = {"items": [issue(9, "fix for heapq.merge, bugforge", pr=True), issue(1, "heapq.merge breaks; bugforge"),

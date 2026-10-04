@@ -52,8 +52,25 @@ picks and mathforge's unattended defaults are unchanged.
   model calls. After a report is filed upstream, `--link FOLDER URL` records it
   in the folder's `result.json` and the index links it. The tracker search uses
   `GITHUB_TOKEN`, else the `gh` CLI's login (30 searches a minute instead of 10).
+- **Targets.** `AUTO_TARGETS` holds standard library modules and popular PyPI
+  packages (packaging, idna, python-dateutil, markupsafe, more-itertools,
+  sortedcontainers, isodate, wcwidth, tabulate, yarl), all parsing or
+  arithmetic with no files, processes or network. Python only: a property is
+  tested by importing the module.
+- **Filing.** `--file` files published results that have no upstream report as
+  issues in their project's tracker, as you through `gh`: python/cpython for the
+  standard library, else the GitHub repository the package's metadata names. One
+  open report per project: while one of yours is open there nothing more is filed,
+  and the next goes out once it is closed. Ninety filed at once on python/cpython
+  were all closed unread within minutes. `tracking.json` in the results repository
+  (`{"owner/name": issue URL}`) names a tracking issue that holds a project back
+  the same way. Each result is checked again first: a package must be among the
+  1000 most downloaded on PyPI and installed at its latest release, the reproducer
+  is rerun and must still confirm the bug, and a target that already has a report
+  is skipped. The issue says it was written by a tool and not read by a person.
+  With `--no-post` the issue is drafted as `cN_issue.md` and nothing is filed.
 - **After filing.** A report you filed by hand is found without being told: an issue
-  (or pull request) of yours on python/cpython that mentions bugforge and names the
+  (or pull request) of yours in the project's tracker that mentions bugforge and names the
   result's folder, or the target of exactly one unlinked result, is linked to that
   result. `--link FOLDER URL` does it by hand when two results fit. From then on the
   thread is read after every module of a hunt (`--track` reads it on demand): new
